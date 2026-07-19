@@ -7,15 +7,20 @@ class SignalParser:
     def parse(message: str) -> Optional[TradeSignal]:
         """Парсит сообщение из Telegram в TradeSignal."""
         try:
-            # Ищем символ: #VIRTUALUSDT.P или #BTCUSDT
+            # Ищем символ: #VIRTUALUSDT.P или #LTC/USDT.P или #BTCUSDT
             symbol_match = re.search(r'#(\S+)', message)
             if not symbol_match:
                 return None
             symbol = symbol_match.group(1)
+            # Убираем .P и /
             if symbol.endswith('.P'):
                 symbol = symbol[:-2]
+            symbol = symbol.replace('/', '')
+            # LTCUSDTP -> LTCUSDT (убираем одиночную P в конце)
+            if symbol.endswith('P') and not symbol.endswith('PP'):
+                symbol = symbol[:-1]
             
-            # Определяем сторону: ПРОДАЖА/SELL/SHORT или ПОКУПКА/BUY/LONG
+            # Определяем сторону
             message_upper = message.upper()
             if any(word in message_upper for word in ['ПРОДАЖА', 'SELL', 'SHORT', 'ШОРТ']):
                 side = OrderSide.SHORT
@@ -24,30 +29,58 @@ class SignalParser:
             else:
                 return None
             
-            # Парсим диапазон входа (поддержка разных форматов)
-            entry_match = re.search(r'Диапазон входа:\s*([\d.]+)\s*-\s*([\d.]+)', message)
+            # --- Парсим диапазон входа ---
+            # Старый формат: Диапазон входа: 0.81238-0.80422
+            entry_match = re.search(r'Диапазон входа:\s*\$?([\d.,]+)\s*[-–—]\s*\$?([\d.,]+)', message)
             if not entry_match:
-                entry_match = re.search(r'Entry:\s*([\d.]+)\s*-\s*([\d.]+)', message)
+                # Английский: Entry: 0.5-0.6
+                entry_match = re.search(r'Entry:\s*\$?([\d.,]+)\s*[-–—]\s*\$?([\d.,]+)', message)
             if not entry_match:
                 return None
             
-            entry_min = float(entry_match.group(1))
-            entry_max = float(entry_match.group(2))
+            entry_1 = float(entry_match.group(1).replace(',', '.'))
+            entry_2 = float(entry_match.group(2).replace(',', '.'))
+            entry_min = min(entry_1, entry_2)
+            entry_max = max(entry_1, entry_2)
             
-            # Парсим тейк-профиты
+            # --- Парсим тейк-профиты ---
+            # Старый формат: Тейк-профит 1: 0.82462
             tp_matches = re.findall(r'Тейк-профит\s*\d+:\s*([\d.]+)', message)
             if not tp_matches:
                 tp_matches = re.findall(r'Take[- ]?Profit\s*\d+:\s*([\d.]+)', message, re.IGNORECASE)
+            if not tp_matches:
+                # Новый формат: Цели: $48,4 / $50,9 / $58,9
+                goals_match = re.search(r'(?:Цели|Goals|Targets)[:\s]*(.+)', message, re.IGNORECASE)
+                if goals_match:
+                    goals_text = goals_match.group(1)
+                    tp_matches = re.findall(r'[\d.]+', goals_text.replace(',', '.'))
             
-            take_profits = [float(tp) for tp in tp_matches]
+            take_profits = [float(tp.replace(',', '.')) for tp in tp_matches]
             
-            # Парсим стоп-лосс
-            sl_match = re.search(r'(?:⚠️\s*)?Стоп-лосс:\s*([\d.]+)', message)
+            # --- Парсим стоп-лосс ---
+            stop_loss = None
+            
+            # Старый формат: Стоп-лосс: 0.7675
+            sl_match = re.search(r'(?:⚠️\s*)?Стоп-лосс:\s*\$?([\d.]+)', message)
             if not sl_match:
-                sl_match = re.search(r'Stop[- ]?Loss:\s*([\d.]+)', message, re.IGNORECASE)
-            if not sl_match:
+                sl_match = re.search(r'Stop[- ]?Loss:\s*\$?([\d.]+)', message, re.IGNORECASE)
+            if sl_match:
+                stop_loss = float(sl_match.group(1).replace(',', '.'))
+            
+            # Новый формат: Диапазон стопа: $45,00-44,50
+            if stop_loss is None:
+                sl_range_match = re.search(r'(?:Диапазон стопа|Stop range)[:\s]*\$?([\d.,]+)\s*[-–—]\s*\$?([\d.,]+)', message, re.IGNORECASE)
+                if sl_range_match:
+                    sl_1 = float(sl_range_match.group(1).replace(',', '.'))
+                    sl_2 = float(sl_range_match.group(2).replace(',', '.'))
+                    # Ближний стоп в зависимости от стороны
+                    if side == OrderSide.LONG:
+                        stop_loss = max(sl_1, sl_2)  # ближе к цене сверху
+                    else:
+                        stop_loss = min(sl_1, sl_2)  # ближе к цене снизу
+            
+            if stop_loss is None:
                 return None
-            stop_loss = float(sl_match.group(1))
             
             return TradeSignal(
                 symbol=symbol,
