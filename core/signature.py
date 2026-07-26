@@ -43,3 +43,16 @@ class SignatureGenerator:
             'language': 'en-US',
             'Content-Type': 'application/json'
         }
+
+    def generate_websocket(self) -> dict:
+        nonce = uuid.uuid4().hex
+        timestamp = int(time.time())
+        digest = self.sha256_hex(
+            nonce + str(timestamp) + self.api_key
+        )
+        return {
+            "apiKey": self.api_key,
+            "timestamp": timestamp,
+            "nonce": nonce,
+            "sign": self.sha256_hex(digest + self.api_secret),
+        }

@@ -17,12 +17,17 @@ from services.proposal_service import (
     ProposalService,
 )
 from config.access import TelegramAccessConfig
+from config.monitoring import MonitoringConfig
 from models.management import ManagementAction, ManagementProposal
 from services.management_proposal_service import (
     ManagementProposalError,
     ManagementProposalService,
 )
 from services.position_service import PositionService
+from services.position_monitor import PositionMonitor
+from services.private_websocket import BitunixPrivateWebSocket
+from services.protection_service import ProtectionService
+from services.trade_journal import CsvTradeJournal, JournalEvent
 
 load_dotenv()
 
@@ -41,6 +46,10 @@ class FuturesBot:
             os.environ,
             self.execution.mode,
         )
+        self.monitoring = MonitoringConfig.from_env(
+            os.environ,
+            self.execution.mode,
+        )
         
         self.client = BitunixClient(
             api_key,
@@ -50,10 +59,64 @@ class FuturesBot:
         self.account_service = AccountService(self.client)
         self.order_service = OrderService(self.client)
         self.position_service = PositionService(self.client)
+        self.protection_service = ProtectionService(self.client)
+        self.journal = CsvTradeJournal(
+            self.monitoring.journal_path
+        )
+        self.monitor = None
+        self.websocket = None
+        self.websocket_task = None
         self.execution_service = ExecutionService(
             self.order_service,
             self.account_service,
         )
+
+    async def post_init(self, application: Application) -> None:
+        if not self.monitoring.enabled:
+            return
+        api_key = self.client.sig_gen.api_key
+        api_secret = self.client.sig_gen.api_secret
+        if not api_key or not api_secret:
+            raise ValueError(
+                "Bitunix credentials are required for monitoring"
+            )
+
+        async def notify(text: str) -> None:
+            for chat_id in self.access.allowed_user_ids:
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                )
+
+        self.monitor = PositionMonitor(
+            self.order_service,
+            self.position_service,
+            self.protection_service,
+            self.journal,
+            notify,
+        )
+        self.websocket = BitunixPrivateWebSocket(
+            api_key,
+            api_secret,
+            self.monitoring.websocket_url,
+            self.monitor.handle_event,
+            connected_handler=self.monitor.reconcile,
+            status_handler=notify,
+        )
+        self.websocket_task = asyncio.create_task(
+            self.websocket.run(),
+            name="bitunix-private-websocket",
+        )
+
+    async def post_shutdown(self, application: Application) -> None:
+        if self.websocket is not None:
+            await self.websocket.stop()
+        if self.websocket_task is not None:
+            self.websocket_task.cancel()
+            await asyncio.gather(
+                self.websocket_task,
+                return_exceptions=True,
+            )
 
     async def _authorize(self, update: Update) -> bool:
         user_id = update.effective_user.id if update.effective_user else None
@@ -294,6 +357,45 @@ class FuturesBot:
                 proposal.plan,
             )
             result = execution_result.to_dict()
+            await asyncio.to_thread(
+                self.journal.append,
+                JournalEvent(
+                    event_type="execution",
+                    status=execution_result.status,
+                    symbol=proposal.plan.symbol,
+                    side=proposal.plan.side.value,
+                    order_type=proposal.plan.order_type,
+                    entry_price=str(
+                        proposal.plan.planned_entry_price
+                    ),
+                    quantity=str(proposal.plan.total_quantity),
+                    leverage=str(proposal.plan.leverage),
+                    risk_percent=str(
+                        proposal.plan.risk_percent
+                    ),
+                    stop_loss=str(proposal.plan.stop_loss),
+                    take_profit=str(
+                        proposal.plan.take_profits[0].price
+                    ),
+                    proposal_id=proposal.proposal_id,
+                    execution_id=proposal.plan.execution_id,
+                    user_id=str(
+                        update.effective_user.id
+                        if update.effective_user
+                        else ""
+                    ),
+                    mode=self.execution.mode.value,
+                    order_id=(
+                        execution_result.orders[0].order_id
+                        if execution_result.orders
+                        else ""
+                    ),
+                    simulated=str(
+                        execution_result.simulated
+                    ).lower(),
+                    error=execution_result.error or "",
+                ),
+            )
             
             if result["success"]:
                 if result["simulated"]:
@@ -536,7 +638,12 @@ def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     proxy_url = os.getenv("TELEGRAM_PROXY", None)
     
-    builder = Application.builder().token(token)
+    builder = (
+        Application.builder()
+        .token(token)
+        .post_init(bot.post_init)
+        .post_shutdown(bot.post_shutdown)
+    )
     if proxy_url:
         builder = builder.proxy_url(proxy_url)
     else:

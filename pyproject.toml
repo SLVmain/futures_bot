@@ -1,12 +1,18 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "futures-bot"
 version = "0.1.0"
 description = "Telegram-assisted Bitunix futures trading bot"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "python-dotenv>=1.2,<2",
     "python-telegram-bot>=22.8,<23",
     "requests>=2.34,<3",
+    "websockets>=15,<17",
 ]
 
 [project.optional-dependencies]
@@ -18,3 +24,15 @@ test = [
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = [
+    "config*",
+    "core*",
+    "models*",
+    "services*",
+]
+exclude = ["tests*"]
+
+[tool.setuptools]
+py-modules = ["main", "telegram_bot"]
