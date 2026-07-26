@@ -83,8 +83,27 @@ def test_rejects_plan_outside_entry_range_without_orders():
     result = ExecutionService(orders).execute(make_plan(in_range=False))
 
     assert result.success is False
-    assert result.error == "Цена вне диапазона"
+    assert result.error == (
+        "Цена вне диапазона, но цена лимитного ордера не задана"
+    )
     assert orders.calls == []
+
+
+def test_outside_range_executes_limit_order_at_planned_price():
+    orders = FakeOrderService()
+    plan = make_plan(in_range=False)
+    plan = TradePlan(
+        **{
+            **plan.__dict__,
+            "limit_price": 50,
+        }
+    )
+
+    result = ExecutionService(orders).execute(plan)
+
+    assert result.success is True
+    assert orders.calls[0]["price"] == 50
+    assert orders.calls[0]["quantity"] == plan.total_quantity
 
 
 def test_first_order_failure_is_not_partial():

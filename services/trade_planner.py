@@ -2,6 +2,7 @@ from decimal import (
     Decimal,
     InvalidOperation,
     ROUND_DOWN,
+    ROUND_HALF_UP,
     ROUND_UP,
 )
 
@@ -171,11 +172,22 @@ class TradePlanner:
         entry_min = min(signal.entry_min, signal.entry_max)
         entry_max = max(signal.entry_min, signal.entry_max)
         in_range = entry_min <= current_price <= entry_max
+        limit_price = None
+        planned_entry = Decimal(str(current_price))
+        if not in_range:
+            planned_entry = (
+                (
+                    Decimal(str(entry_min))
+                    + Decimal(str(entry_max))
+                )
+                / Decimal("2")
+            ).quantize(price_step, rounding=ROUND_HALF_UP)
+            limit_price = float(planned_entry)
 
         quantity, risk_budget = self._position_metrics(
             signal,
             account,
-            current_price,
+            float(planned_entry),
             instrument,
             normalized_stop,
         )
@@ -195,17 +207,25 @@ class TradePlanner:
         )
         if (
             signal.side is OrderSide.LONG
-            and normalized_take_profit <= Decimal(str(current_price))
+            and normalized_take_profit <= planned_entry
         ):
             raise TradePlanningError(
-                "Для LONG тейк-профит должен быть выше цены"
+                "Для LONG тейк-профит должен быть выше "
+                "плановой цены входа. "
+                f"TP1: {normalized_take_profit}; "
+                f"цена входа: {planned_entry}; "
+                f"текущая цена Bitunix: {current_price}"
             )
         if (
             signal.side is OrderSide.SHORT
-            and normalized_take_profit >= Decimal(str(current_price))
+            and normalized_take_profit >= planned_entry
         ):
             raise TradePlanningError(
-                "Для SHORT тейк-профит должен быть ниже цены"
+                "Для SHORT тейк-профит должен быть ниже "
+                "плановой цены входа. "
+                f"TP1: {normalized_take_profit}; "
+                f"цена входа: {planned_entry}; "
+                f"текущая цена Bitunix: {current_price}"
             )
         take_profits = (
             PlannedTakeProfit(
@@ -227,4 +247,5 @@ class TradePlanner:
             leverage=self.settings.leverage,
             risk_percent=self.settings.risk_percent,
             risk_budget=float(risk_budget),
+            limit_price=limit_price,
         )

@@ -25,14 +25,27 @@ class TradePlan:
     leverage: int
     risk_percent: float
     risk_budget: float
+    limit_price: float | None = None
     execution_id: str = field(
         default_factory=lambda: uuid4().hex
     )
 
     @property
+    def planned_entry_price(self) -> float:
+        return (
+            self.limit_price
+            if self.limit_price is not None
+            else self.current_price
+        )
+
+    @property
+    def order_type(self) -> str:
+        return "LIMIT" if self.limit_price is not None else "MARKET"
+
+    @property
     def estimated_stop_loss(self) -> float:
         return (
-            abs(self.current_price - self.stop_loss)
+            abs(self.planned_entry_price - self.stop_loss)
             * self.total_quantity
         )
 
@@ -40,7 +53,7 @@ class TradePlan:
     def margin_required(self) -> float:
         return (
             self.total_quantity
-            * self.current_price
+            * self.planned_entry_price
             / self.leverage
         )
 
@@ -52,6 +65,9 @@ class TradePlan:
             "entry_min": self.entry_min,
             "entry_max": self.entry_max,
             "current_price": self.current_price,
+            "planned_entry_price": self.planned_entry_price,
+            "order_type": self.order_type,
+            "limit_price": self.limit_price,
             "in_range": self.in_range,
             "total_quantity": self.total_quantity,
             "stop_loss": self.stop_loss,

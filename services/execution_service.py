@@ -20,10 +20,13 @@ class ExecutionService:
         self.account_service = account_service
 
     def execute(self, plan: TradePlan) -> TradeExecutionResult:
-        if not plan.in_range:
+        if not plan.in_range and plan.limit_price is None:
             return TradeExecutionResult(
                 success=False,
-                error="Цена вне диапазона",
+                error=(
+                    "Цена вне диапазона, но цена лимитного "
+                    "ордера не задана"
+                ),
             )
         if self.account_service is not None:
             self.account_service.ensure_leverage(
@@ -38,7 +41,8 @@ class ExecutionService:
         )
         print(f"   Общий объём: {plan.total_quantity}")
         print(
-            f"   Цена: {plan.current_price} | "
+            f"   Ордер: {plan.order_type} | "
+            f"Цена входа: {plan.planned_entry_price} | "
             f"SL: {plan.stop_loss}"
         )
 
@@ -64,7 +68,7 @@ class ExecutionService:
                 result = method(
                     symbol=plan.symbol,
                     quantity=plan.total_quantity,
-                    price=None,
+                    price=plan.limit_price,
                     sl_price=plan.stop_loss,
                     tp_price=take_profit.price,
                     client_id=(

@@ -257,6 +257,50 @@ def test_rejects_invalid_stop_loss_direction(
         )
 
 
+def test_short_tp_error_contains_tp_and_current_price():
+    with pytest.raises(
+        TradePlanningError,
+        match=(
+            r"TP1: 55\.00; цена входа: 50; "
+            r"текущая цена Bitunix: 50"
+        ),
+    ):
+        make_planner().create_plan(
+            make_signal(
+                side=OrderSide.SHORT,
+                stop_loss=60,
+                take_profits=[55],
+            ),
+            AccountBalance("USDT", "1000"),
+        )
+
+
+def test_outside_range_creates_limit_plan_at_midpoint():
+    plan = make_planner(price=60).create_plan(
+        make_signal(),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.in_range is False
+    assert plan.order_type == "LIMIT"
+    assert plan.limit_price == 50
+    assert plan.planned_entry_price == 50
+    assert plan.total_quantity == 2
+    assert plan.estimated_stop_loss == 10
+
+
+def test_inside_range_creates_market_plan():
+    plan = make_planner(price=50).create_plan(
+        make_signal(),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.in_range is True
+    assert plan.order_type == "MARKET"
+    assert plan.limit_price is None
+    assert plan.planned_entry_price == 50
+
+
 @pytest.mark.parametrize(
     ("available", "leverage", "risk_percent", "message"),
     [

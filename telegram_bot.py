@@ -192,23 +192,26 @@ class FuturesBot:
             order_info = plan.to_order_info()
             
             current = order_info["current_price"]
+            planned_entry = order_info["planned_entry_price"]
             total_qty = order_info["total_quantity"]
             sl = order_info["stop_loss"]
             take_profits = order_info["take_profits"]
             tp_quantities = order_info["tp_quantities"]
             risk_budget = order_info["risk_budget"]
-            position_value = total_qty * current
+            position_value = total_qty * planned_entry
             
             if signal.side.value == "LONG":
-                sl_loss = (current - sl) * total_qty
+                sl_loss = (planned_entry - sl) * total_qty
             else:
-                sl_loss = (sl - current) * total_qty
+                sl_loss = (sl - planned_entry) * total_qty
             
             text = f"📊 *РАСЧЁТ*\n\n"
             text += f"Режим: `{self.execution.mode.value}`\n"
             text += f"*{signal.side.value} {order_info['symbol']}*\n"
             text += f"Плечо: {leverage}x | Риск: {risk}%\n"
-            text += f"Цена: {current}\n"
+            text += f"Текущая цена Bitunix: {current}\n"
+            text += f"Тип ордера: {order_info['order_type']}\n"
+            text += f"Плановая цена входа: {planned_entry}\n"
             text += f"Объём: {total_qty}\n"
             text += f"Позиция: {position_value:.2f} USDT\n"
             text += f"SL: {sl} (−{sl_loss:.2f} USDT)\n\n"
@@ -221,9 +224,9 @@ class FuturesBot:
             for i, (tp, qty) in enumerate(zip(take_profits, tp_quantities)):
                 share = qty / total_qty * 100
                 if signal.side.value == "LONG":
-                    profit = (tp - current) * qty
+                    profit = (tp - planned_entry) * qty
                 else:
-                    profit = (current - tp) * qty
+                    profit = (planned_entry - tp) * qty
                 text += f"TP{i+1}: {tp} | {qty} ({share:.0f}%) | +{profit:.2f} USDT\n"
             
             await msg.delete()
@@ -297,6 +300,11 @@ class FuturesBot:
                     msg = (
                         "🧪 *Симуляция завершена*\n"
                         "Ордера не отправлялись на Bitunix.\n\n"
+                    )
+                elif proposal.plan.order_type == "LIMIT":
+                    msg = (
+                        "✅ *Лимитный ордер отправлен!*\n"
+                        "Позиция появится после его исполнения.\n\n"
                     )
                 else:
                     msg = "✅ *Сделка открыта!*\n\n"
