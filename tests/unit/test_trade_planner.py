@@ -1,0 +1,286 @@
+from dataclasses import FrozenInstanceError
+
+import pytest
+
+from config.settings import TradeSettings
+from core.api_models import (
+    AccountBalance,
+    MarketTicker,
+    TradingPair,
+)
+from models.signal import OrderSide, TradeSignal
+from models.trade import TradePlanningError
+from services.trade_planner import TradePlanner
+
+
+class FixedMarket:
+    def __init__(self, price, instrument=None):
+        self.price = price
+        self.calls = 0
+        self.instrument = instrument or TradingPair(
+            symbol="BTCUSDT",
+            min_trade_volume="0.0001",
+            max_market_order_volume="50000",
+            base_precision=6,
+            quote_precision=2,
+            min_leverage=1,
+            max_leverage=125,
+            symbol_status="OPEN",
+            api_supported=True,
+        )
+
+    def get_ticker(self, symbol):
+        self.calls += 1
+        return MarketTicker(symbol=symbol, last_price=self.price)
+
+    def get_trading_pair(self, symbol):
+        return self.instrument
+
+
+def test_creates_immutable_trade_plan():
+    market = FixedMarket(50)
+    planner = TradePlanner(
+        market,
+        TradeSettings(leverage=10, risk_percent=1),
+    )
+    signal = TradeSignal(
+        symbol="BTCUSDT",
+        side=OrderSide.LONG,
+        entry_min=49,
+        entry_max=51,
+        take_profits=[55, 60, 65],
+        stop_loss=45,
+    )
+    account = AccountBalance("USDT", "1000")
+
+    plan = planner.create_plan(signal, account)
+
+    assert plan.symbol == "BTCUSDT"
+    assert plan.total_quantity == 2.0
+    assert tuple(item.quantity for item in plan.take_profits) == (2.0,)
+    assert tuple(item.price for item in plan.take_profits) == (55.0,)
+    assert plan.risk_budget == 10
+    assert plan.estimated_stop_loss == 10
+    assert plan.margin_required == 10
+    assert market.calls == 1
+
+    with pytest.raises(FrozenInstanceError):
+        plan.total_quantity = 10
+
+
+def make_signal(
+    side=OrderSide.LONG,
+    stop_loss=45,
+    take_profits=None,
+):
+    if take_profits is None:
+        take_profits = (
+            [55, 60, 65]
+            if side is OrderSide.LONG
+            else [45, 40, 35]
+        )
+    return TradeSignal(
+        symbol="BTCUSDT",
+        side=side,
+        entry_min=49,
+        entry_max=51,
+        take_profits=take_profits,
+        stop_loss=stop_loss,
+    )
+
+
+def make_planner(
+    price=50,
+    leverage=10,
+    risk_percent=1,
+    max_tp_count=3,
+    instrument=None,
+):
+    return TradePlanner(
+        FixedMarket(price, instrument),
+        TradeSettings(
+            leverage=leverage,
+            risk_percent=risk_percent,
+            max_tp_count=max_tp_count,
+        ),
+    )
+
+
+def test_position_size_uses_distance_to_stop_loss():
+    account = AccountBalance("USDT", "1000")
+
+    tight_stop = make_planner().create_plan(
+        make_signal(stop_loss=49),
+        account,
+    )
+    wide_stop = make_planner().create_plan(
+        make_signal(stop_loss=40),
+        account,
+    )
+
+    assert tight_stop.total_quantity == 10
+    assert tight_stop.estimated_stop_loss == 10
+    assert wide_stop.total_quantity == 1
+    assert wide_stop.estimated_stop_loss == 10
+
+
+def test_position_size_is_capped_by_available_margin():
+    plan = make_planner(leverage=1).create_plan(
+        make_signal(stop_loss=49.99),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.total_quantity == 20
+    assert plan.margin_required == 1000
+    assert plan.estimated_stop_loss < plan.risk_budget
+
+
+def test_position_size_rounds_down_to_six_decimals():
+    plan = make_planner().create_plan(
+        make_signal(stop_loss=47),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.total_quantity == 3.333333
+    assert plan.estimated_stop_loss <= plan.risk_budget
+
+
+def test_short_position_uses_distance_to_stop_loss():
+    plan = make_planner().create_plan(
+        make_signal(side=OrderSide.SHORT, stop_loss=55),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.total_quantity == 2
+    assert plan.estimated_stop_loss == 10
+
+
+def test_single_take_profit_receives_full_quantity():
+    plan = make_planner(max_tp_count=1).create_plan(
+        make_signal(take_profits=[55]),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert [item.quantity for item in plan.take_profits] == [2]
+
+
+def test_only_first_take_profit_receives_full_quantity():
+    plan = make_planner(max_tp_count=2).create_plan(
+        make_signal(take_profits=[55, 60]),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert len(plan.take_profits) == 1
+    assert plan.take_profits[0].price == 55
+    assert plan.take_profits[0].quantity == plan.total_quantity
+
+
+def test_instrument_precision_rounds_prices_conservatively():
+    instrument = TradingPair(
+        symbol="BTCUSDT",
+        min_trade_volume="0.001",
+        max_market_order_volume="100",
+        base_precision=3,
+        quote_precision=1,
+        min_leverage=1,
+        max_leverage=20,
+        symbol_status="OPEN",
+        api_supported=True,
+    )
+    plan = make_planner(instrument=instrument).create_plan(
+        make_signal(
+            stop_loss=45.04,
+            take_profits=[55.09, 60.09, 65.09],
+        ),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.stop_loss == 45.1
+    assert [item.price for item in plan.take_profits] == [55.0]
+    assert sum(
+        item.quantity for item in plan.take_profits
+    ) == plan.total_quantity
+
+
+def test_rejects_leverage_above_instrument_limit():
+    instrument = TradingPair(
+        symbol="BTCUSDT",
+        min_trade_volume="0.001",
+        max_market_order_volume="100",
+        base_precision=3,
+        quote_precision=1,
+        min_leverage=1,
+        max_leverage=5,
+        symbol_status="OPEN",
+        api_supported=True,
+    )
+
+    with pytest.raises(TradePlanningError, match="Плечо вне диапазона"):
+        make_planner(
+            leverage=10,
+            instrument=instrument,
+        ).create_plan(
+            make_signal(),
+            AccountBalance("USDT", "1000"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("side", "stop_loss", "message"),
+    [
+        (
+            OrderSide.LONG,
+            51,
+            "Для LONG стоп-лосс должен быть ниже",
+        ),
+        (
+            OrderSide.SHORT,
+            49,
+            "Для SHORT стоп-лосс должен быть выше",
+        ),
+        (
+            OrderSide.LONG,
+            50,
+            "Расстояние до стоп-лосса не может быть нулевым",
+        ),
+    ],
+)
+def test_rejects_invalid_stop_loss_direction(
+    side,
+    stop_loss,
+    message,
+):
+    with pytest.raises(TradePlanningError, match=message):
+        make_planner().create_plan(
+            make_signal(side=side, stop_loss=stop_loss),
+            AccountBalance("USDT", "1000"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("available", "leverage", "risk_percent", "message"),
+    [
+        ("0", 10, 1, "Недостаточно средств"),
+        ("1000", 0, 1, "Плечо должно быть положительным"),
+        (
+            "1000",
+            10,
+            0,
+            "Процент риска должен быть положительным",
+        ),
+    ],
+)
+def test_rejects_invalid_risk_inputs(
+    available,
+    leverage,
+    risk_percent,
+    message,
+):
+    with pytest.raises(TradePlanningError, match=message):
+        make_planner(
+            leverage=leverage,
+            risk_percent=risk_percent,
+        ).create_plan(
+            make_signal(),
+            AccountBalance("USDT", available),
+        )

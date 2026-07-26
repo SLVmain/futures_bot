@@ -5,6 +5,8 @@ from services.account_service import AccountService
 from services.signal_parser import SignalParser
 from services.trade_service import TradeService
 from config.settings import TradeSettings
+from config.execution import ExecutionConfig
+from models.trade import TradePlanningError
 
 load_dotenv()
 
@@ -22,9 +24,12 @@ def main():
         tp3_share=0.25,     # 25% на третий
     )
     
-    client = BitunixClient(api_key, api_secret)
+    execution = ExecutionConfig.from_env(os.environ)
+    client = BitunixClient(api_key, api_secret, execution)
     account_service = AccountService(client)
     trade_service = TradeService(client, settings)
+
+    print(f"🛡️ Режим исполнения: {execution.mode.value}")
     
     test_message = """#ASTERUSDT.P ПРОДАЖА
 
@@ -49,16 +54,17 @@ def main():
     print(signal)
     
     account = account_service.get_account("USDT")
-    if account.get("code") != 0:
-        print(f"❌ Ошибка: {account.get('msg')}")
-        return
-    
-    account_data = account["data"]
-    balance = float(account_data['available'])
+    balance = float(account.available)
     print(f"\n💰 Баланс: {balance} USDT")
     
     print("\n📊 Проверка цены...")
-    order_info = trade_service.prepare_order(signal, account_data)
+    try:
+        plan = trade_service.build_plan(signal, account)
+    except TradePlanningError as error:
+        print(f"❌ Не готово: {error}")
+        return
+
+    order_info = plan.to_order_info()
     
     if order_info["ready"]:
         current = order_info["current_price"]
@@ -69,6 +75,7 @@ def main():
         sl = order_info["stop_loss"]
         take_profits = order_info["take_profits"]
         tp_quantities = order_info["tp_quantities"]
+        risk_budget = order_info["risk_budget"]
         
         position_value = total_qty * current
         risk_pct = (position_value / balance) * 100
@@ -93,6 +100,10 @@ def main():
         print(f"   Общий объём: {total_qty}")
         print(f"   Позиция: {position_value:.2f} USDT ({risk_pct:.1f}% от депозита)")
         print(f"   Стоп-лосс: {sl} (потеря: {sl_loss:.2f} USDT / {sl_loss_pct:.2f}%)")
+        print(
+            f"   Риск-бюджет: {risk_budget:.2f} USDT | "
+            f"Расчётный риск: {sl_loss:.2f} USDT"
+        )
         print(f"\n📊 ТЕЙК-ПРОФИТЫ:")
         
         for i, (tp, qty) in enumerate(zip(take_profits, tp_quantities)):
@@ -108,12 +119,28 @@ def main():
         if order_info["in_range"]:
             choice = input("\n🔔 Цена в диапазоне! Войти в сделку? (y/n): ").lower()
             if choice == 'y':
-                result = trade_service.enter_position(signal, account_data)
+                result = trade_service.execute_plan(plan).to_dict()
                 if result["success"]:
-                    print(f"\n✅ Сделка открыта!")
+                    if result["simulated"]:
+                        print(
+                            "\n🧪 Симуляция завершена. "
+                            "Ордера не отправлялись на Bitunix."
+                        )
+                    else:
+                        print(f"\n✅ Сделка открыта!")
                     for o in result["orders"]:
                         print(f"   TP{o['tp']} @ {o['price']}: {o['qty']} | ID: {o['id']}")
                 else:
+                    if result.get("partial"):
+                        print(
+                            "⚠️ Позиция открыта частично. "
+                            "Автоматическое продолжение остановлено."
+                        )
+                        for order in result["orders"]:
+                            print(
+                                f"   TP{order['tp']} "
+                                f"ID: {order['id']}"
+                            )
                     print(f"❌ Ошибка входа: {result['error']}")
             else:
                 print("❌ Вход отменён")
@@ -122,8 +149,5 @@ def main():
                 print(f"\n📉 Цена НИЖЕ диапазона. Ждём роста до {entry_min}")
             else:
                 print(f"\n📈 Цена ВЫШЕ диапазона. Ждём снижения до {entry_max}")
-    else:
-        print(f"❌ Не готово: {order_info['reason']}")
-
 if __name__ == "__main__":
     main()
