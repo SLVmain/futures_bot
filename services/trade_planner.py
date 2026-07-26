@@ -193,46 +193,66 @@ class TradePlanner:
         )
         total_quantity = float(quantity)
 
-        if not signal.take_profits:
+        selected_prices = signal.take_profits[
+            :self.settings.max_tp_count
+        ]
+        if not selected_prices:
             raise TradePlanningError("Не указан тейк-профит")
-        normalized_take_profit = Decimal(
-            str(signal.take_profits[0])
-        ).quantize(
-            price_step,
-            rounding=(
-                ROUND_DOWN
-                if signal.side is OrderSide.LONG
-                else ROUND_UP
-            ),
+        distributions = {
+            1: (100,),
+            2: (60, 40),
+            3: (50, 30, 20),
+            4: (40, 30, 20, 10),
+            5: (40, 25, 15, 10, 10),
+        }
+        shares = distributions[len(selected_prices)]
+        quantity_step = Decimal("1").scaleb(
+            -instrument.base_precision
         )
-        if (
-            signal.side is OrderSide.LONG
-            and normalized_take_profit <= planned_entry
+        remaining = quantity
+        planned = []
+        for index, (raw_price, share) in enumerate(
+            zip(selected_prices, shares),
+            start=1,
         ):
-            raise TradePlanningError(
-                "Для LONG тейк-профит должен быть выше "
-                "плановой цены входа. "
-                f"TP1: {normalized_take_profit}; "
-                f"цена входа: {planned_entry}; "
-                f"текущая цена Bitunix: {current_price}"
+            price = Decimal(str(raw_price)).quantize(
+                price_step,
+                rounding=(
+                    ROUND_DOWN
+                    if signal.side is OrderSide.LONG
+                    else ROUND_UP
+                ),
             )
-        if (
-            signal.side is OrderSide.SHORT
-            and normalized_take_profit >= planned_entry
-        ):
-            raise TradePlanningError(
-                "Для SHORT тейк-профит должен быть ниже "
-                "плановой цены входа. "
-                f"TP1: {normalized_take_profit}; "
-                f"цена входа: {planned_entry}; "
-                f"текущая цена Bitunix: {current_price}"
+            invalid = (
+                signal.side is OrderSide.LONG
+                and price <= planned_entry
+            ) or (
+                signal.side is OrderSide.SHORT
+                and price >= planned_entry
             )
-        take_profits = (
-            PlannedTakeProfit(
-                price=float(normalized_take_profit),
-                quantity=total_quantity,
-            ),
-        )
+            if invalid:
+                raise TradePlanningError(
+                    f"TP{index} расположен с неверной стороны "
+                    f"от цены входа. TP: {price}; "
+                    f"цена входа: {planned_entry}; "
+                    f"текущая цена Bitunix: {current_price}"
+                )
+            if index == len(shares):
+                tp_quantity = remaining
+            else:
+                tp_quantity = (
+                    quantity * Decimal(share) / Decimal("100")
+                ).quantize(quantity_step, rounding=ROUND_DOWN)
+                remaining -= tp_quantity
+            if tp_quantity < Decimal(instrument.min_trade_volume):
+                raise TradePlanningError(
+                    f"Объём TP{index} меньше минимального"
+                )
+            planned.append(PlannedTakeProfit(
+                price=float(price),
+                quantity=float(tp_quantity),
+            ))
+        take_profits = tuple(planned)
 
         return TradePlan(
             symbol=signal.symbol,

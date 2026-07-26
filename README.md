@@ -28,14 +28,21 @@ Private monitoring additionally requires:
 ENABLE_PRIVATE_WEBSOCKET=true
 ```
 
-It is forcibly disabled in `dry-run`. Do not enable it until the API key has
-read/trade permissions only and withdrawals are disabled.
+It is forcibly disabled in `dry-run` and required in `live`, because partial
+TP orders are installed only after the entry fill is confirmed. Do not enable
+live mode until the API key has read/trade permissions only and withdrawals
+are disabled.
 
 ## Trading flow
 
 - A signal is parsed in Telegram.
 - Risk-based quantity is calculated from the planned entry and stop loss.
-- Only TP1 is used, for 100% of the position.
+- The entry order uses the full quantity and includes the common SL.
+- After the entry is confirmed filled, partial TP orders are added. Three
+  targets use 50/30/20; five use 40/25/15/10/10.
+- After TP1 is confirmed filled by WebSocket, the remaining SL is moved to
+  a fee-aware break-even based on the actual average entry, deducted fees,
+  paid funding, estimated closing taker fee, and one price tick of buffer.
 - Price inside the entry range creates a market order.
 - Price outside the range creates a limit order at the range midpoint.
 - Every state-changing command requires a one-time confirmation.

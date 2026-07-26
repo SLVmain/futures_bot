@@ -57,8 +57,16 @@ def test_creates_immutable_trade_plan():
 
     assert plan.symbol == "BTCUSDT"
     assert plan.total_quantity == 2.0
-    assert tuple(item.quantity for item in plan.take_profits) == (2.0,)
-    assert tuple(item.price for item in plan.take_profits) == (55.0,)
+    assert tuple(item.quantity for item in plan.take_profits) == (
+        1.0,
+        0.6,
+        0.4,
+    )
+    assert tuple(item.price for item in plan.take_profits) == (
+        55.0,
+        60.0,
+        65.0,
+    )
     assert plan.risk_budget == 10
     assert plan.estimated_stop_loss == 10
     assert plan.margin_required == 10
@@ -164,15 +172,15 @@ def test_single_take_profit_receives_full_quantity():
     assert [item.quantity for item in plan.take_profits] == [2]
 
 
-def test_only_first_take_profit_receives_full_quantity():
+def test_two_take_profits_use_sixty_forty_distribution():
     plan = make_planner(max_tp_count=2).create_plan(
         make_signal(take_profits=[55, 60]),
         AccountBalance("USDT", "1000"),
     )
 
-    assert len(plan.take_profits) == 1
+    assert len(plan.take_profits) == 2
     assert plan.take_profits[0].price == 55
-    assert plan.take_profits[0].quantity == plan.total_quantity
+    assert [item.quantity for item in plan.take_profits] == [1.2, 0.8]
 
 
 def test_instrument_precision_rounds_prices_conservatively():
@@ -196,7 +204,11 @@ def test_instrument_precision_rounds_prices_conservatively():
     )
 
     assert plan.stop_loss == 45.1
-    assert [item.price for item in plan.take_profits] == [55.0]
+    assert [item.price for item in plan.take_profits] == [
+        55.0,
+        60.0,
+        65.0,
+    ]
     assert sum(
         item.quantity for item in plan.take_profits
     ) == plan.total_quantity
@@ -261,7 +273,7 @@ def test_short_tp_error_contains_tp_and_current_price():
     with pytest.raises(
         TradePlanningError,
         match=(
-            r"TP1: 55\.00; цена входа: 50; "
+            r"TP1 расположен.*TP: 55\.00; цена входа: 50; "
             r"текущая цена Bitunix: 50"
         ),
     ):
@@ -299,6 +311,24 @@ def test_inside_range_creates_market_plan():
     assert plan.order_type == "MARKET"
     assert plan.limit_price is None
     assert plan.planned_entry_price == 50
+
+
+def test_five_take_profits_use_configured_distribution():
+    plan = make_planner(max_tp_count=5).create_plan(
+        make_signal(take_profits=[55, 60, 65, 70, 75]),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert [item.quantity for item in plan.take_profits] == [
+        0.8,
+        0.5,
+        0.3,
+        0.2,
+        0.2,
+    ]
+    assert sum(
+        item.quantity for item in plan.take_profits
+    ) == plan.total_quantity
 
 
 @pytest.mark.parametrize(

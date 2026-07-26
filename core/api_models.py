@@ -235,6 +235,9 @@ class OpenPosition:
     unrealized_pnl: str
     liquidation_price: str
     average_open_price: str
+    fee: str = "0"
+    funding: str = "0"
+    realized_pnl: str = "0"
 
     @classmethod
     def list_from_response(
@@ -278,6 +281,11 @@ class OpenPosition:
                     ),
                     average_open_price=str(
                         item.get("avgOpenPrice", "0")
+                    ),
+                    fee=str(item.get("fee", "0")),
+                    funding=str(item.get("funding", "0")),
+                    realized_pnl=str(
+                        item.get("realizedPNL", "0")
                     ),
                 )
             )

@@ -55,8 +55,8 @@ class ExecutionService:
             start=1,
         ):
             print(
-                f"   TP{index}: {take_profit.price} | "
-                f"{plan.total_quantity} (100%)"
+                "   TP будут добавлены после подтверждённого "
+                "исполнения входа"
             )
 
             method = (
@@ -70,7 +70,7 @@ class ExecutionService:
                     quantity=plan.total_quantity,
                     price=plan.limit_price,
                     sl_price=plan.stop_loss,
-                    tp_price=take_profit.price,
+                    tp_price=None,
                     client_id=(
                         f"bot-{plan.execution_id[:20]}-{index}"
                     ),

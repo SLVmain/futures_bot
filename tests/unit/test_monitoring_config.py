@@ -27,6 +27,11 @@ def test_live_monitoring_uses_official_private_url():
     assert config.journal_path == Path("data/trade_journal.csv")
 
 
+def test_live_mode_requires_private_monitoring():
+    with pytest.raises(ValueError, match="required"):
+        MonitoringConfig.from_env({}, ExecutionMode.LIVE)
+
+
 def test_testnet_requires_separate_websocket_url():
     with pytest.raises(ValueError, match="required"):
         MonitoringConfig.from_env(

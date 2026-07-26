@@ -71,6 +71,8 @@ def test_executes_existing_plan_without_market_lookup():
     assert result.simulated is True
     assert len(result.orders) == 1
     assert [call["quantity"] for call in orders.calls] == [2]
+    assert orders.calls[0]["tp_price"] is None
+    assert orders.calls[0]["sl_price"] == 45
     assert [call["client_id"] for call in orders.calls] == [
         f"bot-{plan.execution_id[:20]}-1",
     ]

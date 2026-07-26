@@ -1,3 +1,6 @@
+from decimal import Decimal
+from types import SimpleNamespace
+
 from core.api_models import OpenPosition
 from services.protection_service import ProtectionService
 
@@ -45,3 +48,34 @@ def test_detects_missing_stop_loss():
     assert client.call[0] == (
         "/api/v1/futures/tpsl/get_pending_orders"
     )
+
+
+def test_fee_aware_break_even_includes_paid_costs():
+    long_position = SimpleNamespace(
+        average_open_price="50",
+        quantity="2",
+        side="LONG",
+        fee="0.05",
+        funding="-0.02",
+    )
+    short_position = SimpleNamespace(
+        average_open_price="50",
+        quantity="2",
+        side="SHORT",
+        fee="0.05",
+        funding="-0.02",
+    )
+
+    long_price = ProtectionService.fee_aware_break_even(
+        long_position,
+        2,
+        Decimal("0.0006"),
+    )
+    short_price = ProtectionService.fee_aware_break_even(
+        short_position,
+        2,
+        Decimal("0.0006"),
+    )
+
+    assert long_price == Decimal("50.08")
+    assert short_price == Decimal("49.92")

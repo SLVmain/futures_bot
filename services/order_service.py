@@ -132,6 +132,19 @@ class OrderService:
         )
         return PendingOrder.list_from_response(response)
 
+    def get_order_detail(
+        self,
+        client_id: str,
+    ) -> dict:
+        response = self.client.get(
+            "/api/v1/futures/trade/get_order_detail",
+            urlencode({"clientId": client_id}),
+        )
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("Order detail data must be an object")
+        return data
+
     def cancel_orders(
         self,
         symbol: str,

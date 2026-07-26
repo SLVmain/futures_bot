@@ -28,6 +28,7 @@ from services.position_monitor import PositionMonitor
 from services.private_websocket import BitunixPrivateWebSocket
 from services.protection_service import ProtectionService
 from services.trade_journal import CsvTradeJournal, JournalEvent
+from services.market_service import MarketService
 
 load_dotenv()
 
@@ -59,6 +60,7 @@ class FuturesBot:
         self.account_service = AccountService(self.client)
         self.order_service = OrderService(self.client)
         self.position_service = PositionService(self.client)
+        self.market_service = MarketService(self.client)
         self.protection_service = ProtectionService(self.client)
         self.journal = CsvTradeJournal(
             self.monitoring.journal_path
@@ -94,6 +96,8 @@ class FuturesBot:
             self.protection_service,
             self.journal,
             notify,
+            self.market_service,
+            self.monitoring.taker_fee_rate,
         )
         self.websocket = BitunixPrivateWebSocket(
             api_key,
@@ -352,11 +356,24 @@ class FuturesBot:
         await query.edit_message_text("⏳ Вхожу в сделку...")
         
         try:
+            execution_client_id = (
+                f"bot-{proposal.plan.execution_id[:20]}-1"
+            )
+            if self.monitor is not None:
+                self.monitor.register_plan(
+                    execution_client_id,
+                    proposal.plan,
+                )
             execution_result = await asyncio.to_thread(
                 self.execution_service.execute,
                 proposal.plan,
             )
             result = execution_result.to_dict()
+            if (
+                self.monitor is not None
+                and not execution_result.success
+            ):
+                self.monitor.discard_plan(execution_client_id)
             await asyncio.to_thread(
                 self.journal.append,
                 JournalEvent(
@@ -636,15 +653,24 @@ class FuturesBot:
             header = "✅ *Рыночный ордер отправлен!*"
             status = "исполнение подтверждается Bitunix"
 
-        order = result["orders"][0]
+        tp_lines = "\n".join(
+            f"TP{index}: {take_profit.price} — "
+            f"{take_profit.quantity} "
+            f"({take_profit.quantity / plan.total_quantity * 100:.0f}%)"
+            for index, take_profit in enumerate(
+                plan.take_profits,
+                start=1,
+            )
+        )
         return (
             f"{header}\n\n"
             f"Тип ордера: {plan.order_type}\n"
             f"Вход: {plan.planned_entry_price}\n"
             f"Объём: {plan.total_quantity}\n"
-            f"TP1: {order['price']} — {order['qty']} (100%)\n"
+            f"{tp_lines}\n"
             f"SL: {result['stop_loss']}\n"
-            f"Статус: {status}"
+            f"Статус входа: {status}\n"
+            "TP будут добавлены после исполнения входа."
         )
 
 

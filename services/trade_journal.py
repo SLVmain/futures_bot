@@ -100,3 +100,137 @@ class CsvTradeJournal:
             if deduplication_id:
                 self._seen_event_ids.add(deduplication_id)
             return True
+
+    def save_plan(self, client_id: str, plan) -> None:
+        for index, take_profit in enumerate(
+            plan.take_profits,
+            start=1,
+        ):
+            self.append(JournalEvent(
+                event_type="planned_tp",
+                status="PENDING",
+                symbol=plan.symbol,
+                side=plan.side.value,
+                order_type=plan.order_type,
+                entry_price=str(plan.planned_entry_price),
+                quantity=str(take_profit.quantity),
+                stop_loss=str(plan.stop_loss),
+                take_profit=str(take_profit.price),
+                execution_id=plan.execution_id,
+                client_id=client_id,
+                source_event_id=f"plan:{client_id}:{index}",
+            ))
+
+    def finish_plan(self, client_id: str, status: str) -> None:
+        self.append(JournalEvent(
+            event_type="planned_tp_status",
+            status=status,
+            client_id=client_id,
+            source_event_id=f"plan:{client_id}:{status}",
+        ))
+
+    def load_pending_plans(self) -> dict[str, object]:
+        if not self.path.exists():
+            return {}
+        with self.path.open(
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as stream:
+            rows = list(csv.DictReader(stream))
+        finished = {
+            row["client_id"]
+            for row in rows
+            if row.get("event_type") == "planned_tp_status"
+        }
+        groups = {}
+        for row in rows:
+            client_id = row.get("client_id", "")
+            if (
+                row.get("event_type") == "planned_tp"
+                and client_id
+                and client_id not in finished
+            ):
+                groups.setdefault(client_id, []).append(row)
+
+        from models.signal import OrderSide
+        from models.trade import PlannedTakeProfit, TradePlan
+
+        plans = {}
+        for client_id, plan_rows in groups.items():
+            first = plan_rows[0]
+            entry = float(first["entry_price"])
+            plans[client_id] = TradePlan(
+                symbol=first["symbol"],
+                side=OrderSide(first["side"]),
+                entry_min=entry,
+                entry_max=entry,
+                current_price=entry,
+                in_range=first["order_type"] == "MARKET",
+                total_quantity=sum(
+                    float(row["quantity"])
+                    for row in plan_rows
+                ),
+                stop_loss=float(first["stop_loss"]),
+                take_profits=tuple(
+                    PlannedTakeProfit(
+                        float(row["take_profit"]),
+                        float(row["quantity"]),
+                    )
+                    for row in plan_rows
+                ),
+                leverage=0,
+                risk_percent=0,
+                risk_budget=0,
+                limit_price=(
+                    entry
+                    if first["order_type"] == "LIMIT"
+                    else None
+                ),
+                execution_id=first["execution_id"],
+            )
+        return plans
+
+    def save_tp_order(
+        self,
+        order_id: str,
+        position_id: str,
+        client_id: str,
+        tp_number: int,
+    ) -> None:
+        self.append(JournalEvent(
+            event_type="tp_order",
+            status=f"TP{tp_number}_ACTIVE",
+            client_id=client_id,
+            order_id=order_id,
+            position_id=position_id,
+            source_event_id=f"tp-order:{order_id}",
+        ))
+
+    def load_active_tp1_orders(self) -> dict[str, str]:
+        if not self.path.exists():
+            return {}
+        with self.path.open(
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as stream:
+            rows = list(csv.DictReader(stream))
+        completed_positions = {
+            row["position_id"]
+            for row in rows
+            if (
+                row.get("event_type") == "break_even"
+                and row.get("status") == "COMPLETED"
+            )
+        }
+        return {
+            row["order_id"]: row["position_id"]
+            for row in rows
+            if (
+                row.get("event_type") == "tp_order"
+                and row.get("status") == "TP1_ACTIVE"
+                and row.get("position_id")
+                not in completed_positions
+            )
+        }

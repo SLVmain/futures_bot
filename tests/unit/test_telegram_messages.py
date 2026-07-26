@@ -38,4 +38,5 @@ def test_limit_order_result_is_explicitly_formatted():
     assert "Объём: 13356" in message
     assert "TP1: 0.01655 — 13356 (100%)" in message
     assert "SL: 0.014" in message
-    assert "Статус: ожидает исполнения" in message
+    assert "Статус входа: ожидает исполнения" in message
+    assert "TP будут добавлены после исполнения" in message

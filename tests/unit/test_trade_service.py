@@ -85,7 +85,7 @@ def test_calculates_position_size_from_stop_loss_risk():
     assert quantity == 2.0
 
 
-def test_prepare_order_uses_only_first_tp_for_full_quantity():
+def test_prepare_order_uses_all_configured_take_profits():
     service = TradeService(
         UnusedClient(),
         TradeSettings(
@@ -104,8 +104,8 @@ def test_prepare_order_uses_only_first_tp_for_full_quantity():
     assert result["ready"] is True
     assert result["in_range"] is True
     assert result["total_quantity"] == 2.0
-    assert result["take_profits"] == [55.0]
-    assert result["tp_quantities"] == [2.0]
+    assert result["take_profits"] == [55.0, 60.0, 65.0]
+    assert result["tp_quantities"] == [1.0, 0.6, 0.4]
     assert result["risk_budget"] == 10
     assert result["estimated_stop_loss"] == 10
     assert service.market.calls == 1

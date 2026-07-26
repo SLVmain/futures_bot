@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from decimal import Decimal, InvalidOperation
 from typing import Mapping
 
 from config.execution import ExecutionMode
@@ -10,6 +11,7 @@ class MonitoringConfig:
     enabled: bool
     websocket_url: str | None
     journal_path: Path
+    taker_fee_rate: Decimal
 
     @classmethod
     def from_env(
@@ -25,6 +27,11 @@ class MonitoringConfig:
         )
         if mode is ExecutionMode.DRY_RUN:
             enabled = False
+        elif mode is ExecutionMode.LIVE and not enabled:
+            raise ValueError(
+                "ENABLE_PRIVATE_WEBSOCKET=true is required "
+                "in live mode"
+            )
 
         websocket_url = None
         if enabled:
@@ -51,4 +58,19 @@ class MonitoringConfig:
                 "data/trade_journal.csv",
             )
         )
-        return cls(enabled, websocket_url, path)
+        try:
+            taker_fee_rate = Decimal(
+                environ.get(
+                    "FUTURES_TAKER_FEE_RATE",
+                    "0.0006",
+                )
+            )
+        except InvalidOperation as error:
+            raise ValueError(
+                "FUTURES_TAKER_FEE_RATE must be a decimal"
+            ) from error
+        if not Decimal("0") <= taker_fee_rate < Decimal("1"):
+            raise ValueError(
+                "FUTURES_TAKER_FEE_RATE must be between 0 and 1"
+            )
+        return cls(enabled, websocket_url, path, taker_fee_rate)
