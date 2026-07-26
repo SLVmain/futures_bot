@@ -398,21 +398,10 @@ class FuturesBot:
             )
             
             if result["success"]:
-                if result["simulated"]:
-                    msg = (
-                        "🧪 *Симуляция завершена*\n"
-                        "Ордера не отправлялись на Bitunix.\n\n"
-                    )
-                elif proposal.plan.order_type == "LIMIT":
-                    msg = (
-                        "✅ *Лимитный ордер отправлен!*\n"
-                        "Позиция появится после его исполнения.\n\n"
-                    )
-                else:
-                    msg = "✅ *Сделка открыта!*\n\n"
-                for o in result["orders"]:
-                    msg += f"TP{o['tp']} @ {o['price']}: {o['qty']}\n"
-                msg += f"\nSL: {result['stop_loss']}"
+                msg = self._format_success_message(
+                    proposal.plan,
+                    result,
+                )
                 await query.edit_message_text(msg, parse_mode='Markdown')
             else:
                 if result.get("partial"):
@@ -631,6 +620,32 @@ class FuturesBot:
         user_data.pop(LEVERAGE_KEY, None)
         user_data.pop(RISK_KEY, None)
         ProposalService.discard(user_data)
+
+    @staticmethod
+    def _format_success_message(plan, result: dict) -> str:
+        if result["simulated"]:
+            header = (
+                "🧪 *Симуляция завершена*\n"
+                "Ордер не отправлялся на Bitunix."
+            )
+            status = "симуляция"
+        elif plan.order_type == "LIMIT":
+            header = "✅ *Лимитный ордер отправлен!*"
+            status = "ожидает исполнения"
+        else:
+            header = "✅ *Рыночный ордер отправлен!*"
+            status = "исполнение подтверждается Bitunix"
+
+        order = result["orders"][0]
+        return (
+            f"{header}\n\n"
+            f"Тип ордера: {plan.order_type}\n"
+            f"Вход: {plan.planned_entry_price}\n"
+            f"Объём: {plan.total_quantity}\n"
+            f"TP1: {order['price']} — {order['qty']} (100%)\n"
+            f"SL: {result['stop_loss']}\n"
+            f"Статус: {status}"
+        )
 
 
 def main():
