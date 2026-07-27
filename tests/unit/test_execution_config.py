@@ -20,18 +20,8 @@ def test_rejects_unknown_mode():
         ExecutionConfig.from_env({"TRADING_MODE": "paper"})
 
 
-def test_live_requires_second_explicit_flag():
-    with pytest.raises(ValueError, match="Live trading requires"):
-        ExecutionConfig.from_env({"TRADING_MODE": "live"})
-
-
-def test_live_requires_exact_true_value():
-    config = ExecutionConfig.from_env(
-        {
-            "TRADING_MODE": "live",
-            "BITUNIX_LIVE_TRADING_ENABLED": "true",
-        }
-    )
+def test_live_mode_uses_single_mode_variable():
+    config = ExecutionConfig.from_env({"TRADING_MODE": "live"})
 
     assert config.mode is ExecutionMode.LIVE
     assert config.base_url == PRODUCTION_BASE_URL

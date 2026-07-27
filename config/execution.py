@@ -42,15 +42,6 @@ class ExecutionConfig:
             cls._validate_testnet_url(base_url)
             return cls(mode=mode, base_url=base_url.rstrip("/"))
 
-        live_enabled = environ.get(
-            "BITUNIX_LIVE_TRADING_ENABLED", ""
-        ).strip().lower()
-        if live_enabled != "true":
-            raise ValueError(
-                "Live trading requires "
-                "BITUNIX_LIVE_TRADING_ENABLED=true"
-            )
-
         return cls(mode=mode, base_url=PRODUCTION_BASE_URL)
 
     @staticmethod

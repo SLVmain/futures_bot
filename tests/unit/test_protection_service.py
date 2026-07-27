@@ -1,7 +1,10 @@
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from core.api_models import OpenPosition
+from core.errors import BitunixResponseError
 from services.protection_service import ProtectionService
 
 
@@ -79,3 +82,57 @@ def test_fee_aware_break_even_includes_paid_costs():
 
     assert long_price == Decimal("50.08")
     assert short_price == Decimal("49.92")
+
+
+def test_take_profit_error_reports_only_response_shape():
+    class UnexpectedResponseClient:
+        def post(self, *args):
+            return {
+                "code": 0,
+                "data": {
+                    "reference": "sensitive-value",
+                    "status": "SUCCESS",
+                },
+            }
+
+    service = ProtectionService(UnexpectedResponseClient())
+
+    with pytest.raises(BitunixResponseError) as captured:
+        service.place_take_profit(
+            "BTCUSDT",
+            "position-1",
+            55,
+            1,
+        )
+
+    message = str(captured.value)
+    assert "data type=dict, fields=reference,status" in message
+    assert "sensitive-value" not in message
+
+
+@pytest.mark.parametrize(
+    ("data", "order_id"),
+    (
+        ({"orderId": "order-1"}, "order-1"),
+        ({"id": "order-2"}, "order-2"),
+        ({"tpSlOrderId": 3}, "3"),
+        ([{"id": "order-4"}], "order-4"),
+        ("order-5", "order-5"),
+    ),
+)
+def test_take_profit_accepts_supported_order_id_shapes(
+    data,
+    order_id,
+):
+    class Client:
+        def post(self, *args):
+            return {"code": 0, "data": data}
+
+    service = ProtectionService(Client())
+
+    assert service.place_take_profit(
+        "BTCUSDT",
+        "position-1",
+        55,
+        1,
+    ) == order_id

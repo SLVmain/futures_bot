@@ -12,6 +12,45 @@ EventHandler = Callable[[dict], Awaitable[None]]
 StatusHandler = Callable[[str], Awaitable[None]]
 
 
+class WebSocketLoginError(ConnectionError):
+    def __init__(self, code, message, response=None):
+        self.code = str(code) if code is not None else "unknown"
+        clean_message = " ".join(str(message or "no message").split())
+        self.server_message = clean_message[:200]
+        response = response if isinstance(response, dict) else {}
+        self.response_shape = self._response_shape(response)
+        super().__init__(
+            "Bitunix WebSocket login failed: "
+            f"code={self.code}, message={self.server_message}, "
+            f"{self.response_shape}"
+        )
+
+    @staticmethod
+    def _response_shape(response: dict) -> str:
+        fields = ",".join(
+            sorted(str(key) for key in response)
+        ) or "none"
+        markers = []
+        for key in ("op", "event", "success"):
+            value = response.get(key)
+            if isinstance(value, (str, int, float, bool)):
+                clean_value = " ".join(str(value).split())[:80]
+                markers.append(f"{key}={clean_value}")
+        data = response.get("data")
+        if isinstance(data, dict):
+            data_fields = ",".join(
+                sorted(str(key) for key in data)
+            ) or "none"
+            markers.append(f"data_fields={data_fields}")
+            for key in ("code", "success", "result"):
+                value = data.get(key)
+                if isinstance(value, (str, int, float, bool)):
+                    clean_value = " ".join(str(value).split())[:80]
+                    markers.append(f"data.{key}={clean_value}")
+        marker_text = ", ".join(markers) or "markers=none"
+        return f"fields={fields}; {marker_text}"
+
+
 class BitunixPrivateWebSocket:
     channels = ("order", "position", "balance", "tpsl")
 
@@ -24,7 +63,7 @@ class BitunixPrivateWebSocket:
         connector=None,
         connected_handler: Callable[[], Awaitable[None]] | None = None,
         status_handler: StatusHandler | None = None,
-        ping_interval: float = 25,
+        ping_interval: float = 15,
         max_backoff: float = 30,
     ):
         self.url = url
@@ -47,13 +86,21 @@ class BitunixPrivateWebSocket:
                 raise
             except Exception as error:
                 LOGGER.warning(
-                    "Bitunix WebSocket disconnected: %s",
+                    "Bitunix WebSocket disconnected: %s: %s",
                     type(error).__name__,
+                    error,
                 )
                 if self.status_handler is not None:
+                    detail = ""
+                    if isinstance(error, WebSocketLoginError):
+                        detail = (
+                            f"\nКод: {error.code}"
+                            f"\nПричина: {error.server_message}"
+                            f"\nФормат ответа: {error.response_shape}"
+                        )
                     await self.status_handler(
                         "⚠️ Соединение Bitunix WebSocket потеряно. "
-                        "Бот переподключается."
+                        f"Бот переподключается.{detail}"
                     )
                 try:
                     await asyncio.wait_for(
@@ -68,18 +115,45 @@ class BitunixPrivateWebSocket:
         self._stop.set()
 
     async def _run_connection(self) -> None:
-        connector = self.connector
-        if connector is None:
+        if self.connector is None:
             from websockets.asyncio.client import connect
-            connector = connect
-        async with connector(self.url) as socket:
+            connection = connect(
+                self.url,
+                ping_interval=None,
+                close_timeout=5,
+            )
+        else:
+            connection = self.connector(self.url)
+        async with connection as socket:
             await socket.send(json.dumps({
                 "op": "login",
                 "args": [self.signer.generate_websocket()],
             }))
-            login_response = json.loads(await socket.recv())
+            login_response = await self._receive_login_response(socket)
             if not self._is_success(login_response, "login"):
-                raise ConnectionError("Bitunix WebSocket login failed")
+                login_data = login_response.get("data")
+                login_data = (
+                    login_data
+                    if isinstance(login_data, dict)
+                    else {}
+                )
+                raise WebSocketLoginError(
+                    login_response.get(
+                        "code",
+                        login_data.get("code"),
+                    ),
+                    login_response.get(
+                        "msg",
+                        login_response.get(
+                            "message",
+                            login_data.get(
+                                "msg",
+                                login_data.get("message"),
+                            ),
+                        ),
+                    ),
+                    login_response,
+                )
             await socket.send(json.dumps({
                 "op": "subscribe",
                 "args": [
@@ -110,6 +184,27 @@ class BitunixPrivateWebSocket:
                     "Bitunix WebSocket stream ended"
                 )
 
+    @staticmethod
+    async def _receive_login_response(socket) -> dict:
+        for _ in range(5):
+            raw_message = await asyncio.wait_for(
+                socket.recv(),
+                timeout=10,
+            )
+            message = json.loads(raw_message)
+            if not isinstance(message, dict):
+                continue
+            operation = message.get(
+                "op",
+                message.get("event"),
+            )
+            if operation == "connect":
+                continue
+            return message
+        raise ConnectionError(
+            "Bitunix WebSocket login response was not received"
+        )
+
     async def _ping(self, socket) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(self.ping_interval)
@@ -120,6 +215,22 @@ class BitunixPrivateWebSocket:
 
     @staticmethod
     def _is_success(message: dict, operation: str) -> bool:
-        if message.get("op") != operation:
+        response_operation = message.get(
+            "op",
+            message.get("event"),
+        )
+        if response_operation != operation:
             return False
-        return message.get("code", 0) in (0, "0")
+        if "code" in message:
+            return message["code"] in (0, "0")
+        if message.get("success") is True:
+            return True
+        data = message.get("data")
+        if isinstance(data, dict):
+            if "code" in data:
+                return data["code"] in (0, "0")
+            return (
+                data.get("success") is True
+                or data.get("result") is True
+            )
+        return data is True

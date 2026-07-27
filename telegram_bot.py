@@ -8,7 +8,7 @@ from services.account_service import AccountService
 from services.signal_parser import SignalParser
 from services.trade_service import TradeService
 from config.settings import TradeSettings
-from config.execution import ExecutionConfig
+from config.execution import ExecutionConfig, ExecutionMode
 from models.trade import TradePlanningError, TradeProposal
 from services.execution_service import ExecutionService
 from services.order_service import OrderService
@@ -74,6 +74,16 @@ class FuturesBot:
         )
 
     async def post_init(self, application: Application) -> None:
+        if self.execution.mode is ExecutionMode.LIVE:
+            for chat_id in self.access.allowed_user_ids:
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "🚨 ВНИМАНИЕ: БОТ ЗАПУЩЕН В LIVE-РЕЖИМЕ\n"
+                        "Подтверждённые сделки создают реальные "
+                        "ордера на Bitunix."
+                    ),
+                )
         if not self.monitoring.enabled:
             return
         api_key = self.client.sig_gen.api_key
@@ -83,11 +93,31 @@ class FuturesBot:
                 "Bitunix credentials are required for monitoring"
             )
 
-        async def notify(text: str) -> None:
+        async def notify(
+            text: str,
+            action_id: str | None = None,
+        ) -> None:
+            reply_markup = None
+            if action_id is not None:
+                reply_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "✅ Перенести SL",
+                        callback_data=(
+                            f"breakeven:confirm:{action_id}"
+                        ),
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Оставить как есть",
+                        callback_data=(
+                            f"breakeven:cancel:{action_id}"
+                        ),
+                    ),
+                ]])
             for chat_id in self.access.allowed_user_ids:
                 await application.bot.send_message(
                     chat_id=chat_id,
                     text=text,
+                    reply_markup=reply_markup,
                 )
 
         self.monitor = PositionMonitor(
@@ -447,9 +477,14 @@ class FuturesBot:
     async def mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._authorize(update):
             return
-        await update.message.reply_text(
-            f"🛡️ Режим исполнения: {self.execution.mode.value}"
-        )
+        if self.execution.mode is ExecutionMode.LIVE:
+            text = (
+                "🚨 Режим исполнения: LIVE\n"
+                "Подтверждение сделки отправит реальный ордер."
+            )
+        else:
+            text = f"🛡️ Режим исполнения: {self.execution.mode.value}"
+        await update.message.reply_text(text)
 
     async def positions(
         self,
@@ -631,6 +666,49 @@ class FuturesBot:
         except Exception as error:
             await query.edit_message_text(f"❌ Ошибка: {error}")
 
+    async def break_even_button_handler(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        if not await self._authorize(update):
+            return
+        query = update.callback_query
+        await query.answer()
+        try:
+            prefix, decision, proposal_id = query.data.split(":", 2)
+            if (
+                prefix != "breakeven"
+                or decision not in {"confirm", "cancel"}
+            ):
+                raise ValueError
+        except ValueError:
+            await query.edit_message_text("❌ Некорректная кнопка")
+            return
+        if self.monitor is None:
+            await query.edit_message_text(
+                "❌ Мониторинг позиции недоступен"
+            )
+            return
+        if decision == "confirm":
+            await query.edit_message_text(
+                "⏳ Проверяю позицию и пересчитываю безубыток..."
+            )
+        try:
+            result = await self.monitor.confirm_break_even(
+                proposal_id,
+                decision == "confirm",
+            )
+            icon = "✅" if decision == "confirm" else "ℹ️"
+            await query.edit_message_text(f"{icon} {result}")
+        except ValueError as error:
+            await query.edit_message_text(f"❌ {error}")
+        except Exception as error:
+            await query.edit_message_text(
+                "❌ Не удалось изменить SL: "
+                f"{type(error).__name__}. Проверьте позицию на Bitunix."
+            )
+
     @staticmethod
     def _reset_user_state(user_data):
         user_data.pop(SIGNAL_KEY, None)
@@ -713,12 +791,18 @@ def main():
         pattern=r"^manage:",
     ))
     app.add_handler(CallbackQueryHandler(
+        bot.break_even_button_handler,
+        pattern=r"^breakeven:",
+    ))
+    app.add_handler(CallbackQueryHandler(
         bot.button_handler,
         pattern=r"^(enter|cancel):",
     ))
     
     print("🤖 Бот запущен...")
     print(f"🛡️ Режим исполнения: {bot.execution.mode.value}")
+    if bot.execution.mode is ExecutionMode.LIVE:
+        print("🚨 LIVE: ПОДТВЕРЖДЁННЫЕ СДЕЛКИ БУДУТ РЕАЛЬНЫМИ")
     app.run_polling()
 
 if __name__ == "__main__":

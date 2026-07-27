@@ -50,11 +50,13 @@ class ProtectionService:
             },
         )
         data = response.get("data")
-        if not isinstance(data, dict) or not data.get("orderId"):
+        order_id = self._extract_order_id(data)
+        if order_id is None:
             raise BitunixResponseError(
-                "TP order identity is missing"
+                "TP order identity is missing; "
+                f"{self._response_shape(data)}"
             )
-        return str(data["orderId"])
+        return order_id
 
     def modify_stop_loss(
         self,
@@ -74,11 +76,46 @@ class ProtectionService:
             },
         )
         data = response.get("data")
-        if not isinstance(data, dict) or not data.get("orderId"):
+        order_id = self._extract_order_id(data)
+        if order_id is None:
             raise BitunixResponseError(
-                "Modified SL identity is missing"
+                "Modified SL identity is missing; "
+                f"{self._response_shape(data)}"
             )
-        return str(data["orderId"])
+        return order_id
+
+    @classmethod
+    def _extract_order_id(cls, data) -> str | None:
+        if isinstance(data, dict):
+            for key in ("orderId", "id", "tpSlOrderId"):
+                value = data.get(key)
+                if value not in (None, ""):
+                    return str(value)
+            return None
+        if isinstance(data, list) and len(data) == 1:
+            return cls._extract_order_id(data[0])
+        if isinstance(data, (str, int)) and str(data):
+            return str(data)
+        return None
+
+    @staticmethod
+    def _response_shape(data) -> str:
+        if isinstance(data, dict):
+            fields = ",".join(
+                sorted(str(key) for key in data)
+            ) or "none"
+            return f"data type=dict, fields={fields}"
+        if isinstance(data, list):
+            item_type = (
+                type(data[0]).__name__
+                if data
+                else "empty"
+            )
+            return (
+                "data type=list, "
+                f"length={len(data)}, item type={item_type}"
+            )
+        return f"data type={type(data).__name__}"
 
     @staticmethod
     def fee_aware_break_even(

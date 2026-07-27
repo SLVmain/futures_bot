@@ -1,6 +1,7 @@
 import pytest
 
 from core.api_client import BitunixClient
+from core.api_models import OpenPosition
 from services.position_service import PositionService
 from tests.fixtures.bitunix_responses import (
     CLOSE_POSITION_SUCCESS,
@@ -35,12 +36,39 @@ def test_get_open_positions_builds_query_and_parses_response():
     assert positions[0].symbol == "BTCUSDT"
     assert positions[0].quantity == "0.5"
     assert positions[0].average_open_price == "60000"
+    assert positions[0].side == "LONG"
     assert client.get_calls == [
         (
             "/api/v1/futures/position/get_pending_positions",
             "symbol=BTCUSDT&positionId=12345678",
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("api_side", "position_side"),
+    (
+        ("BUY", "LONG"),
+        ("LONG", "LONG"),
+        ("SELL", "SHORT"),
+        ("SHORT", "SHORT"),
+    ),
+)
+def test_open_position_normalizes_exchange_side(
+    api_side,
+    position_side,
+):
+    response = {
+        "data": [{
+            "positionId": "position-1",
+            "symbol": "BTCUSDT",
+            "side": api_side,
+        }],
+    }
+
+    position = OpenPosition.list_from_response(response)[0]
+
+    assert position.side == position_side
 
 
 def test_close_position_posts_only_position_id():

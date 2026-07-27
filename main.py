@@ -5,7 +5,7 @@ from services.account_service import AccountService
 from services.signal_parser import SignalParser
 from services.trade_service import TradeService
 from config.settings import TradeSettings
-from config.execution import ExecutionConfig
+from config.execution import ExecutionConfig, ExecutionMode
 from models.trade import TradePlanningError
 
 load_dotenv()
@@ -30,6 +30,8 @@ def main():
     trade_service = TradeService(client, settings)
 
     print(f"🛡️ Режим исполнения: {execution.mode.value}")
+    if execution.mode is ExecutionMode.LIVE:
+        print("🚨 LIVE: ПОДТВЕРЖДЁННЫЕ СДЕЛКИ БУДУТ РЕАЛЬНЫМИ")
     
     test_message = """#ASTERUSDT.P ПРОДАЖА
 

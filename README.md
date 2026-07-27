@@ -19,8 +19,8 @@ API keys, Telegram tokens, generated CSV journals, or proxy credentials.
 
 - `dry-run` is the safe default.
 - `testnet` requires separate REST and WebSocket testnet URLs.
-- `live` requires `BITUNIX_LIVE_TRADING_ENABLED=true` and a non-empty
-  `TELEGRAM_ALLOWED_USER_IDS`.
+- `live` is enabled by `TRADING_MODE=live` and requires a non-empty
+  `TELEGRAM_ALLOWED_USER_IDS` plus private WebSocket monitoring.
 
 Private monitoring additionally requires:
 
@@ -40,9 +40,11 @@ are disabled.
 - The entry order uses the full quantity and includes the common SL.
 - After the entry is confirmed filled, partial TP orders are added. Three
   targets use 50/30/20; five use 40/25/15/10/10.
-- After TP1 is confirmed filled by WebSocket, the remaining SL is moved to
-  a fee-aware break-even based on the actual average entry, deducted fees,
-  paid funding, estimated closing taker fee, and one price tick of buffer.
+- After TP1 is confirmed filled by WebSocket, Telegram shows the current
+  position details and asks for confirmation. Only after confirmation is the
+  remaining SL moved to fee-aware break-even based on the actual average
+  entry, deducted fees, paid funding, estimated closing taker fee, and one
+  price tick of buffer.
 - Price inside the entry range creates a market order.
 - Price outside the range creates a limit order at the range midpoint.
 - Every state-changing command requires a one-time confirmation.

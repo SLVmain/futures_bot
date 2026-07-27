@@ -267,7 +267,7 @@ class OpenPosition:
                     position_id=str(position_id),
                     symbol=str(symbol),
                     quantity=str(item.get("qty", "0")),
-                    side=str(item.get("side", "")),
+                    side=cls.normalize_side(item.get("side", "")),
                     entry_value=str(item.get("entryValue", "0")),
                     margin_mode=str(item.get("marginMode", "")),
                     position_mode=str(item.get("positionMode", "")),
@@ -290,6 +290,16 @@ class OpenPosition:
                 )
             )
         return tuple(positions)
+
+    @staticmethod
+    def normalize_side(value: object) -> str:
+        side = str(value).upper()
+        return {
+            "BUY": "LONG",
+            "LONG": "LONG",
+            "SELL": "SHORT",
+            "SHORT": "SHORT",
+        }.get(side, side)
 
 
 @dataclass(frozen=True)
