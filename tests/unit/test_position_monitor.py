@@ -1,4 +1,5 @@
 import asyncio
+import csv
 from dataclasses import replace
 
 from models.signal import OrderSide
@@ -112,15 +113,154 @@ def test_order_event_is_journaled_notified_and_deduplicated(tmp_path):
                 "orderId": "order-1",
                 "symbol": "BTCUSDT",
                 "orderStatus": "FILLED",
+                "side": "BUY",
+                "type": "MARKET",
+                "averagePrice": "50.1",
+                "dealAmount": "1",
+                "fee": "0.03",
             },
         }
 
         await monitor.handle_event(event)
         await monitor.handle_event(event)
 
-        assert notifications == [
-            "ℹ️ Ордер исполнен: BTCUSDT, ID order-1"
-        ]
+        assert len(notifications) == 1
+        assert "Исполнен входной ордер" in notifications[0]
+        assert "Позиция: LONG BTCUSDT" in notifications[0]
+        assert "Средняя цена: 50.1" in notifications[0]
+        assert "Исполнено: 1" in notifications[0]
+        assert "Комиссия: 0.03" in notifications[0]
+
+    asyncio.run(scenario())
+
+
+def test_take_profit_fill_notification_contains_position_data(
+    tmp_path,
+):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        monitor._tp_orders["tp-2"] = ("position-1", 2)
+
+        await monitor.handle_event({
+            "ch": "tpsl",
+            "ts": 200,
+            "data": {
+                "orderId": "tp-2",
+                "positionId": "position-1",
+                "symbol": "BTCUSDT",
+                "side": "SELL",
+                "status": "FILLED",
+                "tpPrice": "45",
+                "tpQty": "0.3",
+            },
+        })
+
+        message = notifications[0]
+        assert "Исполнен TP2" in message
+        assert "Позиция: SHORT BTCUSDT" in message
+        assert "Триггер: 45" in message
+        assert "Закрыто: 0.3" in message
+        assert "Остаток: 1" in message
+        assert "Realized PnL: 0" in message
+        with monitor.journal.path.open(
+            encoding="utf-8",
+            newline="",
+        ) as stream:
+            rows = list(csv.DictReader(stream))
+        execution = next(
+            row for row in rows
+            if row["event_type"] == "TP2"
+        )
+        assert execution["quantity"] == "0.3"
+        assert execution["take_profit"] == "45"
+        assert execution["remaining_quantity"] == "1"
+        assert execution["fee"] == "0"
+        assert execution["funding"] == "0"
+
+    asyncio.run(scenario())
+
+
+def test_stop_loss_fill_reports_closed_position(tmp_path):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        monitor.positions.get_open_positions = lambda *args: ()
+
+        await monitor.handle_event({
+            "ch": "tpsl",
+            "ts": 300,
+            "data": {
+                "orderId": "sl-1",
+                "positionId": "position-1",
+                "symbol": "BTCUSDT",
+                "side": "SELL",
+                "status": "FILLED",
+                "tpPrice": "",
+                "slPrice": "55",
+                "tpQty": "",
+                "slQty": "1",
+            },
+        })
+
+        message = notifications[0]
+        assert "Исполнен SL" in message
+        assert "Триггер: 55" in message
+        assert "Закрыто: 1" in message
+        assert "Остаток: позиция закрыта" in message
+        with monitor.journal.path.open(
+            encoding="utf-8",
+            newline="",
+        ) as stream:
+            rows = list(csv.DictReader(stream))
+        execution = next(
+            row for row in rows
+            if row["event_type"] == "SL"
+        )
+        assert execution["quantity"] == "1"
+        assert execution["stop_loss"] == "55"
+
+    asyncio.run(scenario())
+
+
+def test_closed_position_writes_trade_summary(tmp_path):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+
+        await monitor.handle_event({
+            "ch": "position",
+            "ts": 400,
+            "data": {
+                "event": "CLOSE",
+                "positionId": "position-1",
+                "symbol": "BTCUSDT",
+                "side": "SELL",
+                "qty": "1",
+                "avgOpenPrice": "50",
+                "leverage": "10",
+                "realizedPNL": "5",
+                "fee": "0.2",
+                "funding": "-0.1",
+            },
+        })
+
+        with monitor.journal.path.open(
+            encoding="utf-8",
+            newline="",
+        ) as stream:
+            rows = list(csv.DictReader(stream))
+        summary = next(
+            row for row in rows
+            if row["event_type"] == "TRADE_SUMMARY"
+        )
+        assert summary["status"] == "CLOSED"
+        assert summary["side"] == "SHORT"
+        assert summary["pnl"] == "5"
+        assert summary["fee"] == "0.2"
+        assert summary["funding"] == "-0.1"
+        assert summary["net_pnl"] == "4.7"
+        assert summary["remaining_quantity"] == "0"
 
     asyncio.run(scenario())
 
@@ -187,6 +327,16 @@ def test_filled_entry_adds_all_partial_take_profits(tmp_path):
         assert monitor._tp1_order_positions == {
             "tp-existing": "position-1",
         }
+        with monitor.journal.path.open(
+            encoding="utf-8",
+            newline="",
+        ) as stream:
+            rows = list(csv.DictReader(stream))
+        entry = next(
+            row for row in rows
+            if row["event_type"] == "ENTRY"
+        )
+        assert entry["order_id"] == "order-1"
 
     asyncio.run(scenario())
 

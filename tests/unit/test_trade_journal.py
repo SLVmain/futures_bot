@@ -70,3 +70,61 @@ def test_pending_take_profit_plan_survives_restart(tmp_path):
     journal = CsvTradeJournal(path)
     journal.finish_plan("client-1", "CONFIGURED")
     assert journal.load_pending_plans() == {}
+
+
+def test_journal_restores_all_take_profit_numbers(tmp_path):
+    journal = CsvTradeJournal(tmp_path / "journal.csv")
+    journal.save_tp_order("tp-1", "position-1", "client-1", 1)
+    journal.save_tp_order("tp-2", "position-1", "client-1", 2)
+
+    assert journal.load_active_tp_orders() == {
+        "tp-1": ("position-1", 1),
+        "tp-2": ("position-1", 2),
+    }
+    assert journal.load_active_tp1_orders() == {
+        "tp-1": "position-1",
+    }
+
+
+def test_existing_csv_schema_is_extended_without_data_loss(tmp_path):
+    path = tmp_path / "journal.csv"
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=(
+                "event_type",
+                "status",
+                "symbol",
+                "source_event_id",
+            ),
+        )
+        writer.writeheader()
+        writer.writerow({
+            "event_type": "order",
+            "status": "FILLED",
+            "symbol": "BTCUSDT",
+            "source_event_id": "old-event",
+        })
+
+    journal = CsvTradeJournal(path)
+    journal.append(JournalEvent(
+        event_type="TRADE_SUMMARY",
+        status="CLOSED",
+        symbol="ETHUSDT",
+        fee="0.2",
+        funding="-0.1",
+        net_pnl="4.7",
+        remaining_quantity="0",
+        source_event_id="new-event",
+    ))
+
+    with path.open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+
+    assert rows[0]["symbol"] == "BTCUSDT"
+    assert rows[0]["source_event_id"] == "old-event"
+    assert rows[0]["fee"] == ""
+    assert rows[1]["symbol"] == "ETHUSDT"
+    assert rows[1]["fee"] == "0.2"
+    assert rows[1]["funding"] == "-0.1"
+    assert rows[1]["net_pnl"] == "4.7"

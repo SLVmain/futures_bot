@@ -30,6 +30,10 @@ class JournalEvent:
     simulated: str = ""
     error: str = ""
     pnl: str = ""
+    fee: str = ""
+    funding: str = ""
+    net_pnl: str = ""
+    remaining_quantity: str = ""
     source_event_id: str = ""
     event_id: str = ""
     timestamp: str = ""
@@ -53,7 +57,50 @@ class CsvTradeJournal:
         self.path = Path(path)
         self._lock = Lock()
         self._seen_event_ids: set[str] = set()
+        self._ensure_schema()
         self._load_seen_event_ids()
+
+    def _ensure_schema(self) -> None:
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return
+        with self.path.open(
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                reader = csv.DictReader(stream)
+                existing_fields = tuple(reader.fieldnames or ())
+                missing_fields = tuple(
+                    name
+                    for name in self.fieldnames
+                    if name not in existing_fields
+                )
+                if not missing_fields:
+                    self.fieldnames = existing_fields
+                    return
+                rows = list(reader)
+                merged_fields = existing_fields + missing_fields
+                temporary_path = self.path.with_suffix(
+                    f"{self.path.suffix}.schema.tmp"
+                )
+                with temporary_path.open(
+                    "w",
+                    encoding="utf-8",
+                    newline="",
+                ) as target:
+                    writer = csv.DictWriter(
+                        target,
+                        fieldnames=merged_fields,
+                    )
+                    writer.writeheader()
+                    writer.writerows(rows)
+                    target.flush()
+                temporary_path.replace(self.path)
+                self.fieldnames = merged_fields
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
     def _load_seen_event_ids(self) -> None:
         if not self.path.exists():
@@ -208,6 +255,16 @@ class CsvTradeJournal:
         ))
 
     def load_active_tp1_orders(self) -> dict[str, str]:
+        return {
+            order_id: position_id
+            for order_id, (position_id, tp_number)
+            in self.load_active_tp_orders().items()
+            if tp_number == 1
+        }
+
+    def load_active_tp_orders(
+        self,
+    ) -> dict[str, tuple[str, int]]:
         if not self.path.exists():
             return {}
         with self.path.open(
@@ -224,13 +281,22 @@ class CsvTradeJournal:
                 and row.get("status") == "COMPLETED"
             )
         }
-        return {
-            row["order_id"]: row["position_id"]
-            for row in rows
+        result = {}
+        for row in rows:
+            status = row.get("status", "")
             if (
-                row.get("event_type") == "tp_order"
-                and row.get("status") == "TP1_ACTIVE"
-                and row.get("position_id")
-                not in completed_positions
+                row.get("event_type") != "tp_order"
+                or not status.startswith("TP")
+                or not status.endswith("_ACTIVE")
+                or row.get("position_id") in completed_positions
+            ):
+                continue
+            try:
+                tp_number = int(status[2:-7])
+            except ValueError:
+                continue
+            result[row["order_id"]] = (
+                row["position_id"],
+                tp_number,
             )
-        }
+        return result

@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 import time
 from uuid import uuid4
 
+from core.api_models import OpenPosition
 from services.order_service import OrderService
 from services.position_service import PositionService
 from services.protection_service import ProtectionService
@@ -12,6 +13,7 @@ from services.trade_journal import CsvTradeJournal, JournalEvent
 
 
 Notifier = Callable[[str, str | None], Awaitable[None]]
+POSITION_UNAVAILABLE = object()
 
 
 @dataclass(frozen=True)
@@ -49,9 +51,13 @@ class PositionMonitor:
         self.taker_fee_rate = taker_fee_rate
         self.position_retry_delays = position_retry_delays
         self._plans_by_client_id = journal.load_pending_plans()
-        self._tp1_order_positions = (
-            journal.load_active_tp1_orders()
-        )
+        self._tp_orders = journal.load_active_tp_orders()
+        self._tp1_order_positions = {
+            order_id: position_id
+            for order_id, (position_id, tp_number)
+            in self._tp_orders.items()
+            if tp_number == 1
+        }
         self._break_even_proposals = {}
 
     def register_plan(self, client_id: str, plan) -> None:
@@ -79,10 +85,27 @@ class PositionMonitor:
             status,
             str(message.get("ts", data.get("mtime", ""))),
         ))
+        position_snapshot = None
+        if channel == "tpsl" and status == "FILLED":
+            position_snapshot = await self._position_after_execution(
+                str(data.get("symbol", "")),
+                str(data.get("positionId", "")),
+            )
+        event_type = self._journal_event_type(
+            channel,
+            data,
+            status,
+        )
+        quantity = self._execution_quantity(channel, data)
+        snapshot = (
+            position_snapshot
+            if position_snapshot not in (None, POSITION_UNAVAILABLE)
+            else None
+        )
         written = await asyncio.to_thread(
             self.journal.append,
             JournalEvent(
-                event_type=channel,
+                event_type=event_type,
                 status=status,
                 symbol=str(data.get("symbol", "")),
                 side=str(data.get("side", "")),
@@ -90,9 +113,7 @@ class PositionMonitor:
                 entry_price=str(
                     data.get("averagePrice", data.get("price", ""))
                 ),
-                quantity=str(
-                    data.get("dealAmount", data.get("qty", ""))
-                ),
+                quantity=quantity,
                 leverage=str(data.get("leverage", "")),
                 stop_loss=str(data.get("slPrice", "")),
                 take_profit=str(data.get("tpPrice", "")),
@@ -100,9 +121,33 @@ class PositionMonitor:
                 order_id=str(data.get("orderId", "")),
                 position_id=str(data.get("positionId", "")),
                 pnl=str(
-                    data.get(
+                    snapshot.realized_pnl
+                    if snapshot is not None
+                    else data.get(
                         "realizedPNL",
                         data.get("unrealizedPNL", ""),
+                    )
+                ),
+                fee=str(
+                    snapshot.fee
+                    if snapshot is not None
+                    else data.get("fee", "")
+                ),
+                funding=str(
+                    snapshot.funding
+                    if snapshot is not None
+                    else data.get("funding", "")
+                ),
+                remaining_quantity=str(
+                    snapshot.quantity
+                    if snapshot is not None
+                    else (
+                        "0"
+                        if (
+                            channel == "position"
+                            and data.get("event") == "CLOSE"
+                        )
+                        else data.get("remainingQty", "")
                     )
                 ),
                 source_event_id=event_id,
@@ -110,7 +155,17 @@ class PositionMonitor:
         )
         if not written:
             return
-        notification = self._notification(channel, data, status)
+        if channel == "position" and data.get("event") == "CLOSE":
+            await asyncio.to_thread(
+                self.journal.append,
+                self._trade_summary_event(message, data),
+            )
+        notification = await self._notification(
+            channel,
+            data,
+            status,
+            position_snapshot,
+        )
         if notification:
             await self.notifier(notification)
         if channel == "order" and status == "FILLED":
@@ -239,6 +294,10 @@ class PositionMonitor:
                     self._tp1_order_positions[tp_order_id] = (
                         position.position_id
                     )
+                self._tp_orders[tp_order_id] = (
+                    position.position_id,
+                    index,
+                )
                 recovered += 1
                 continue
             conflicting = [
@@ -285,6 +344,10 @@ class PositionMonitor:
                     self._tp1_order_positions[tp_order_id] = (
                         position.position_id
                     )
+                self._tp_orders[tp_order_id] = (
+                    position.position_id,
+                    index,
+                )
                 placed += 1
                 reserved_quantity += quantity
             except Exception as error:
@@ -524,11 +587,12 @@ class PositionMonitor:
             elif status in {"CANCELED", "PART_FILLED_CANCELED"}:
                 self.discard_plan(client_id)
 
-    @staticmethod
-    def _notification(
+    async def _notification(
+        self,
         channel: str,
         data: dict,
         status: str,
+        position_snapshot=None,
     ) -> str | None:
         symbol = str(data.get("symbol", ""))
         if channel == "order":
@@ -541,6 +605,21 @@ class PositionMonitor:
             }
             description = descriptions.get(status)
             if description:
+                if status == "FILLED":
+                    side = OpenPosition.normalize_side(
+                        data.get("side", "")
+                    )
+                    return (
+                        "✅ Исполнен входной ордер\n\n"
+                        f"Позиция: {side} {symbol}\n"
+                        f"Тип: {data.get('type', '')}\n"
+                        "Средняя цена: "
+                        f"{data.get('averagePrice', '')}\n"
+                        "Исполнено: "
+                        f"{data.get('dealAmount', data.get('qty', ''))}\n"
+                        f"Комиссия: {data.get('fee', '')}\n"
+                        f"ID: {data.get('orderId', '')}"
+                    )
                 return (
                     f"ℹ️ {description}: {symbol}, "
                     f"ID {data.get('orderId', '')}"
@@ -567,10 +646,157 @@ class PositionMonitor:
                     kind = "SL"
                 else:
                     kind = "TP/SL"
-                return f"🏁 Сработал {kind}: {symbol}"
+                order_id = str(data.get("orderId", ""))
+                tp_details = self._tp_orders.get(order_id)
+                if kind == "TP" and tp_details is not None:
+                    kind = f"TP{tp_details[1]}"
+                position = position_snapshot
+                if position is None:
+                    position = await self._position_after_execution(
+                        symbol,
+                        str(data.get("positionId", "")),
+                    )
+                side = OpenPosition.normalize_side(
+                    data.get("side", "")
+                )
+                trigger_price = data.get(
+                    "tpPrice",
+                ) or data.get(
+                    "slPrice",
+                    "",
+                )
+                executed_quantity = data.get(
+                    "tpQty",
+                ) or data.get(
+                    "slQty",
+                    "",
+                )
+                if position is POSITION_UNAVAILABLE:
+                    position_lines = (
+                        "Остаток: не удалось получить\n"
+                    )
+                elif position is None:
+                    position_lines = (
+                        "Остаток: позиция закрыта\n"
+                    )
+                else:
+                    position_lines = (
+                        f"Остаток: {position.quantity}\n"
+                        f"Realized PnL: {position.realized_pnl}\n"
+                        f"Unrealized PnL: {position.unrealized_pnl}\n"
+                        f"Комиссии: {position.fee}\n"
+                        f"Funding: {position.funding}\n"
+                    )
+                icon = "🎯" if kind.startswith("TP") else "🛑"
+                return (
+                    f"{icon} Исполнен {kind}\n\n"
+                    f"Позиция: {side} {symbol}\n"
+                    f"Триггер: {trigger_price}\n"
+                    f"Закрыто: {executed_quantity}\n"
+                    f"{position_lines}"
+                    f"ID: {order_id}"
+                )
             if status == "CANCELED":
                 return (
                     f"⚠️ Защитный TP/SL отменён: {symbol}, "
                     f"позиция {data.get('positionId', '')}"
                 )
         return None
+
+    def _journal_event_type(
+        self,
+        channel: str,
+        data: dict,
+        status: str,
+    ) -> str:
+        if (
+            channel == "order"
+            and status == "FILLED"
+            and str(data.get("clientId", ""))
+            in self._plans_by_client_id
+        ):
+            return "ENTRY"
+        if channel == "tpsl" and status == "FILLED":
+            order_id = str(data.get("orderId", ""))
+            tp_details = self._tp_orders.get(order_id)
+            if data.get("tpPrice"):
+                return (
+                    f"TP{tp_details[1]}"
+                    if tp_details is not None
+                    else "TP"
+                )
+            if data.get("slPrice"):
+                return "SL"
+        if channel == "position" and data.get("event") == "CLOSE":
+            return "POSITION_CLOSE"
+        return channel
+
+    @staticmethod
+    def _execution_quantity(channel: str, data: dict) -> str:
+        if channel == "tpsl":
+            return str(
+                data.get("tpQty")
+                or data.get("slQty")
+                or data.get("qty", "")
+            )
+        return str(
+            data.get("dealAmount", data.get("qty", ""))
+        )
+
+    @staticmethod
+    def _trade_summary_event(
+        message: dict,
+        data: dict,
+    ) -> JournalEvent:
+        realized = str(data.get("realizedPNL", ""))
+        fee = str(data.get("fee", ""))
+        funding = str(data.get("funding", ""))
+        net_pnl = ""
+        try:
+            net_pnl = str(
+                Decimal(realized or "0")
+                + Decimal(funding or "0")
+                - abs(Decimal(fee or "0"))
+            )
+        except InvalidOperation:
+            pass
+        position_id = str(data.get("positionId", ""))
+        timestamp = str(message.get("ts", data.get("mtime", "")))
+        return JournalEvent(
+            event_type="TRADE_SUMMARY",
+            status="CLOSED",
+            symbol=str(data.get("symbol", "")),
+            side=OpenPosition.normalize_side(data.get("side", "")),
+            entry_price=str(
+                data.get(
+                    "avgOpenPrice",
+                    data.get("averagePrice", ""),
+                )
+            ),
+            quantity=str(data.get("qty", "")),
+            leverage=str(data.get("leverage", "")),
+            position_id=position_id,
+            pnl=realized,
+            fee=fee,
+            funding=funding,
+            net_pnl=net_pnl,
+            remaining_quantity="0",
+            source_event_id=(
+                f"trade-summary:{position_id}:{timestamp}"
+            ),
+        )
+
+    async def _position_after_execution(
+        self,
+        symbol: str,
+        position_id: str,
+    ):
+        try:
+            positions = await asyncio.to_thread(
+                self.positions.get_open_positions,
+                symbol or None,
+                position_id or None,
+            )
+        except Exception:
+            return POSITION_UNAVAILABLE
+        return positions[0] if positions else None
