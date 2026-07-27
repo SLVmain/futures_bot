@@ -1,5 +1,8 @@
+import asyncio
+
 from models.signal import OrderSide
 from models.trade import PlannedTakeProfit, TradePlan
+from services.trade_journal import CsvTradeJournal, JournalEvent
 from telegram_bot import FuturesBot
 
 
@@ -40,3 +43,66 @@ def test_limit_order_result_is_explicitly_formatted():
     assert "SL: 0.014" in message
     assert "Статус входа: ожидает исполнения" in message
     assert "TP будут добавлены после исполнения" in message
+
+
+class FakeMessage:
+    def __init__(self):
+        self.texts = []
+        self.documents = []
+
+    async def reply_text(self, text, **kwargs):
+        self.texts.append(text)
+
+    async def reply_document(self, **kwargs):
+        self.documents.append(kwargs)
+
+
+class FakeUpdate:
+    def __init__(self):
+        self.message = FakeMessage()
+
+
+def make_reporting_bot(tmp_path):
+    bot = FuturesBot.__new__(FuturesBot)
+    bot.journal = CsvTradeJournal(tmp_path / "journal.csv")
+
+    async def authorize(update):
+        return True
+
+    bot._authorize = authorize
+    return bot
+
+
+def test_telegram_trade_reports_and_export(tmp_path):
+    async def scenario():
+        bot = make_reporting_bot(tmp_path)
+        bot.journal.append(JournalEvent(
+            event_type="TRADE_SUMMARY",
+            status="CLOSED",
+            symbol="BTCUSDT",
+            side="LONG",
+            pnl="5",
+            fee="0.2",
+            funding="-0.1",
+            net_pnl="4.7",
+            source_event_id="summary-1",
+        ))
+
+        trades_update = FakeUpdate()
+        stats_update = FakeUpdate()
+        export_update = FakeUpdate()
+
+        await bot.trades(trades_update, None)
+        await bot.stats(stats_update, None)
+        await bot.export_journal(export_update, None)
+
+        assert "BTCUSDT LONG" in trades_update.message.texts[0]
+        assert "net=4.7" in trades_update.message.texts[0]
+        assert "Всего: 1" in stats_update.message.texts[0]
+        assert "Win rate: 100.00%" in stats_update.message.texts[0]
+        assert "Чистый PnL: 4.7" in stats_update.message.texts[0]
+        exported = export_update.message.documents[0]
+        assert exported["filename"] == "trade_journal.csv"
+        assert b"TRADE_SUMMARY" in exported["document"].getvalue()
+
+    asyncio.run(scenario())

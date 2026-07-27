@@ -1,6 +1,8 @@
 import csv
 import fcntl
 from dataclasses import dataclass, fields
+from decimal import Decimal, InvalidOperation
+from io import StringIO
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -48,6 +50,28 @@ class JournalEvent:
             timezone.utc
         ).isoformat()
         return row
+
+
+@dataclass(frozen=True)
+class TradeStatistics:
+    total: int
+    wins: int
+    losses: int
+    breakeven: int
+    realized_pnl: Decimal
+    fees: Decimal
+    funding: Decimal
+    net_pnl: Decimal
+
+    @property
+    def win_rate(self) -> Decimal:
+        if self.total == 0:
+            return Decimal("0")
+        return (
+            Decimal(self.wins)
+            / Decimal(self.total)
+            * Decimal("100")
+        )
 
 
 class CsvTradeJournal:
@@ -300,3 +324,92 @@ class CsvTradeJournal:
                 tp_number,
             )
         return result
+
+    def load_trade_summaries(
+        self,
+        limit: int | None = None,
+    ) -> tuple[dict[str, str], ...]:
+        rows = [
+            row
+            for row in self._read_rows()
+            if row.get("event_type") == "TRADE_SUMMARY"
+        ]
+        if limit is not None:
+            if limit < 0:
+                raise ValueError("limit cannot be negative")
+            rows = rows[-limit:] if limit else []
+        return tuple(reversed(rows))
+
+    def trade_statistics(self) -> TradeStatistics:
+        summaries = self.load_trade_summaries()
+        net_values = [
+            value
+            for row in summaries
+            if (value := self._decimal(row.get("net_pnl"))) is not None
+        ]
+        return TradeStatistics(
+            total=len(summaries),
+            wins=sum(value > 0 for value in net_values),
+            losses=sum(value < 0 for value in net_values),
+            breakeven=sum(value == 0 for value in net_values),
+            realized_pnl=self._sum_column(summaries, "pnl"),
+            fees=sum(
+                (
+                    abs(value)
+                    for row in summaries
+                    if (value := self._decimal(row.get("fee")))
+                    is not None
+                ),
+                Decimal("0"),
+            ),
+            funding=self._sum_column(summaries, "funding"),
+            net_pnl=sum(net_values, Decimal("0")),
+        )
+
+    def csv_snapshot(self) -> bytes:
+        rows = self._read_rows()
+        output = StringIO(newline="")
+        writer = csv.DictWriter(
+            output,
+            fieldnames=self.fieldnames,
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+        return output.getvalue().encode("utf-8")
+
+    def _read_rows(self) -> list[dict[str, str]]:
+        with self._lock:
+            if not self.path.exists():
+                return []
+            with self.path.open(
+                "r",
+                encoding="utf-8",
+                newline="",
+            ) as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+                try:
+                    return list(csv.DictReader(stream))
+                finally:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    @classmethod
+    def _sum_column(
+        cls,
+        rows: tuple[dict[str, str], ...],
+        column: str,
+    ) -> Decimal:
+        return sum(
+            (
+                value
+                for row in rows
+                if (value := cls._decimal(row.get(column))) is not None
+            ),
+            Decimal("0"),
+        )
+
+    @staticmethod
+    def _decimal(value) -> Decimal | None:
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, TypeError):
+            return None

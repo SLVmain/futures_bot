@@ -63,11 +63,28 @@ are appended to `data/trade_journal.csv` and sent to allowed Telegram users.
 The CSV journal is append-only, uses an OS file lock, and deduplicates
 WebSocket events by source event ID. Bitunix remains the source of truth.
 
+### Journal analysis
+
+Install the optional analysis tools:
+
+```bash
+python -m pip install -e ".[analysis]"
+```
+
+Open `notebooks/trade_journal_analysis.ipynb` directly in VS Code and select
+the project `venv` as the notebook kernel. It reads the local CSV without
+contacting Bitunix and shows completed trades, TP/SL executions, net PnL,
+fees, funding, win rate, daily and symbol aggregations, charts, and
+data-quality checks. JupyterLab is not required.
+
 ## Telegram commands
 
 - `/mode`
 - `/positions`
 - `/orders`
+- `/trades`
+- `/stats`
+- `/export`
 - `/cancel_order SYMBOL ORDER_ID`
 - `/close_position POSITION_ID`
 

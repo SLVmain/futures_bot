@@ -1,4 +1,5 @@
 import csv
+from decimal import Decimal
 
 from models.signal import OrderSide
 from models.trade import PlannedTakeProfit, TradePlan
@@ -128,3 +129,52 @@ def test_existing_csv_schema_is_extended_without_data_loss(tmp_path):
     assert rows[1]["fee"] == "0.2"
     assert rows[1]["funding"] == "-0.1"
     assert rows[1]["net_pnl"] == "4.7"
+
+
+def test_trade_report_reads_recent_summaries_and_statistics(tmp_path):
+    journal = CsvTradeJournal(tmp_path / "journal.csv")
+    journal.append(JournalEvent(
+        event_type="TRADE_SUMMARY",
+        status="CLOSED",
+        symbol="BTCUSDT",
+        pnl="5",
+        fee="0.2",
+        funding="-0.1",
+        net_pnl="4.7",
+        source_event_id="summary-1",
+    ))
+    journal.append(JournalEvent(
+        event_type="TRADE_SUMMARY",
+        status="CLOSED",
+        symbol="ETHUSDT",
+        pnl="-2",
+        fee="-0.1",
+        funding="0.05",
+        net_pnl="-2.05",
+        source_event_id="summary-2",
+    ))
+
+    recent = journal.load_trade_summaries(limit=1)
+    statistics = journal.trade_statistics()
+
+    assert len(recent) == 1
+    assert recent[0]["symbol"] == "ETHUSDT"
+    assert statistics.total == 2
+    assert statistics.wins == 1
+    assert statistics.losses == 1
+    assert statistics.breakeven == 0
+    assert statistics.win_rate == Decimal("50.0")
+    assert statistics.realized_pnl == Decimal("3")
+    assert statistics.fees == Decimal("0.3")
+    assert statistics.funding == Decimal("-0.05")
+    assert statistics.net_pnl == Decimal("2.65")
+
+
+def test_csv_snapshot_is_valid_when_journal_does_not_exist(tmp_path):
+    journal = CsvTradeJournal(tmp_path / "missing.csv")
+
+    snapshot = journal.csv_snapshot().decode("utf-8")
+    rows = list(csv.DictReader(snapshot.splitlines()))
+
+    assert rows == []
+    assert "event_type" in snapshot.splitlines()[0]

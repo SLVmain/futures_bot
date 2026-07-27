@@ -1,5 +1,6 @@
 import os
 import asyncio
+from io import BytesIO
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
@@ -537,6 +538,77 @@ class FuturesBot:
         except Exception as error:
             await update.message.reply_text(f"❌ Ошибка: {error}")
 
+    async def trades(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        if not await self._authorize(update):
+            return
+        summaries = await asyncio.to_thread(
+            self.journal.load_trade_summaries,
+            10,
+        )
+        if not summaries:
+            await update.message.reply_text(
+                "Завершённых сделок в журнале пока нет"
+            )
+            return
+        lines = ["Последние завершённые сделки:"]
+        for row in summaries:
+            timestamp = str(row.get("timestamp", "")).replace(
+                "T",
+                " ",
+            )[:19]
+            lines.append(
+                f"{timestamp} | {row.get('symbol', '')} "
+                f"{row.get('side', '')} | "
+                f"net={row.get('net_pnl', '')} | "
+                f"PnL={row.get('pnl', '')}"
+            )
+        await update.message.reply_text("\n".join(lines))
+
+    async def stats(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        if not await self._authorize(update):
+            return
+        stats = await asyncio.to_thread(
+            self.journal.trade_statistics
+        )
+        await update.message.reply_text(
+            "Статистика завершённых сделок:\n"
+            f"Всего: {stats.total}\n"
+            f"Прибыльных: {stats.wins}\n"
+            f"Убыточных: {stats.losses}\n"
+            f"Без результата: {stats.breakeven}\n"
+            f"Win rate: {stats.win_rate:.2f}%\n"
+            f"Realized PnL: {stats.realized_pnl}\n"
+            f"Комиссии: {stats.fees}\n"
+            f"Funding: {stats.funding}\n"
+            f"Чистый PnL: {stats.net_pnl}"
+        )
+
+    async def export_journal(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        if not await self._authorize(update):
+            return
+        snapshot = await asyncio.to_thread(
+            self.journal.csv_snapshot
+        )
+        document = BytesIO(snapshot)
+        document.name = "trade_journal.csv"
+        await update.message.reply_document(
+            document=document,
+            filename="trade_journal.csv",
+            caption="CSV-журнал сделок",
+        )
+
     async def cancel_order(
         self,
         update: Update,
@@ -783,6 +855,9 @@ def main():
     app.add_handler(CommandHandler("mode", bot.mode))
     app.add_handler(CommandHandler("positions", bot.positions))
     app.add_handler(CommandHandler("orders", bot.orders))
+    app.add_handler(CommandHandler("trades", bot.trades))
+    app.add_handler(CommandHandler("stats", bot.stats))
+    app.add_handler(CommandHandler("export", bot.export_journal))
     app.add_handler(CommandHandler("cancel_order", bot.cancel_order))
     app.add_handler(CommandHandler("close_position", bot.close_position))
     app.add_handler(conv_handler)
