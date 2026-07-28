@@ -1,5 +1,6 @@
 import os
 import asyncio
+import logging
 import sys
 from dataclasses import replace
 from io import BytesIO
@@ -10,6 +11,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
+from telegram.error import NetworkError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 from core.api_client import BitunixClient
 from services.account_service import AccountService
@@ -45,6 +47,30 @@ WAITING_RISK = 2
 SIGNAL_KEY = "signal"
 LEVERAGE_KEY = "leverage"
 RISK_KEY = "risk"
+LOGGER = logging.getLogger(__name__)
+
+
+async def telegram_error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    error = context.error
+    if isinstance(error, NetworkError):
+        LOGGER.warning(
+            "Telegram временно недоступен: %s. "
+            "Повторное подключение выполняется автоматически.",
+            type(error).__name__,
+        )
+        return
+    LOGGER.error(
+        "Необработанная ошибка Telegram: %s",
+        type(error).__name__,
+        exc_info=(
+            type(error),
+            error,
+            error.__traceback__,
+        ),
+    )
 
 class FuturesBot:
     def __init__(self):
@@ -572,24 +598,27 @@ class FuturesBot:
         await query.edit_message_text("⏳ Вхожу в сделку...")
         
         try:
-            execution_client_id = (
-                f"bot-{proposal.plan.execution_id[:20]}-1"
-            )
-            if self.monitor is not None:
-                self.monitor.register_plan(
-                    execution_client_id,
-                    proposal.plan,
-                )
             execution_result = await asyncio.to_thread(
                 self.execution_service.execute,
                 proposal.plan,
             )
             result = execution_result.to_dict()
-            if (
-                self.monitor is not None
-                and not execution_result.success
-            ):
-                self.monitor.discard_plan(execution_client_id)
+            if self.monitor is not None and execution_result.orders:
+                client_ids = self.execution_service.client_ids(
+                    proposal.plan
+                )
+                accepted_client_ids = [
+                    client_ids[order.tp_number - 1]
+                    for order in execution_result.orders
+                ]
+                for index, client_id in enumerate(
+                    accepted_client_ids
+                ):
+                    self.monitor.register_plan(
+                        client_id,
+                        proposal.plan,
+                        persist=index == 0,
+                    )
             await asyncio.to_thread(
                 self.journal.append,
                 JournalEvent(
@@ -640,7 +669,9 @@ class FuturesBot:
                 if result.get("partial"):
                     partial_text = (
                         "⚠️ *Позиция открыта частично*\n"
-                        "Дальнейшие заявки остановлены.\n\n"
+                        "Принятые части уже имеют свои TP и SL.\n"
+                        "Отклонённые части повторно не "
+                        "отправлялись.\n\n"
                     )
                     for order in result["orders"]:
                         partial_text += (
@@ -801,22 +832,96 @@ class FuturesBot:
     ):
         if not await self._authorize(update):
             return
+        if not context.args:
+            await self._send_order_selection(update)
+            return
         if len(context.args) != 2:
             await update.message.reply_text(
-                "Использование: /cancel_order SYMBOL ORDER_ID"
+                "Использование: /cancel_order\n"
+                "или /cancel_order SYMBOL ORDER_ID"
             )
             return
         symbol, order_id = context.args
+        orders = await asyncio.to_thread(
+            self.order_service.get_pending_orders,
+            symbol.upper(),
+            order_id,
+        )
+        order = next(
+            (
+                item for item in orders
+                if item.order_id == order_id
+                and item.symbol.upper() == symbol.upper()
+            ),
+            None,
+        )
+        if order is None:
+            await update.message.reply_text(
+                "⚠️ Активный ордер с таким ID и символом не найден."
+            )
+            return
+        await self._propose_order_cancellation(
+            update,
+            context,
+            order,
+        )
+
+    async def _send_order_selection(self, update: Update) -> None:
+        try:
+            orders = await asyncio.to_thread(
+                self.order_service.get_pending_orders
+            )
+        except Exception as error:
+            await update.message.reply_text(f"❌ Ошибка: {error}")
+            return
+        if not orders:
+            await update.message.reply_text("Активных ордеров нет")
+            return
+        keyboard = [
+            [InlineKeyboardButton(
+                (
+                    f"❌ {order.side} {order.symbol} | "
+                    f"{order.quantity} @ {order.price}"
+                ),
+                callback_data=(
+                    f"manage:select_order:{order.order_id}"
+                ),
+            )]
+            for order in orders
+        ]
+        await update.message.reply_text(
+            "Какой ордер отменить?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    async def _propose_order_cancellation(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        order,
+        *,
+        edit: bool = False,
+    ) -> None:
         proposal = ManagementProposal.create(
             ManagementAction.CANCEL_ORDER,
-            order_id,
-            symbol=symbol.upper(),
+            order.order_id,
+            symbol=order.symbol.upper(),
         )
         ManagementProposalService.store(context.user_data, proposal)
+        text = (
+            "Отменить ордер?\n"
+            f"Символ: {order.symbol}\n"
+            f"Сторона: {order.side}\n"
+            f"Тип: {order.order_type}\n"
+            f"Объём: {order.quantity}\n"
+            f"Цена: {order.price}\n"
+            f"ID: {order.order_id}"
+        )
         await self._send_management_confirmation(
             update,
             proposal,
-            f"Отменить ордер {order_id} ({symbol.upper()})?",
+            text,
+            edit=edit,
         )
 
     async def close_position(
@@ -826,20 +931,95 @@ class FuturesBot:
     ):
         if not await self._authorize(update):
             return
+        if not context.args:
+            await self._send_position_selection(update)
+            return
         if len(context.args) != 1:
             await update.message.reply_text(
-                "Использование: /close_position POSITION_ID"
+                "Использование: /close_position\n"
+                "или /close_position POSITION_ID"
             )
             return
-        proposal = ManagementProposal.create(
-            ManagementAction.CLOSE_POSITION,
+        positions = await asyncio.to_thread(
+            self.position_service.get_open_positions,
+            None,
             context.args[0],
         )
+        position = next(
+            (
+                item for item in positions
+                if item.position_id == context.args[0]
+            ),
+            None,
+        )
+        if position is None:
+            await update.message.reply_text(
+                "⚠️ Открытая позиция с таким ID не найдена."
+            )
+            return
+        await self._propose_position_close(
+            update,
+            context,
+            position,
+        )
+
+    async def _send_position_selection(self, update: Update) -> None:
+        try:
+            positions = await asyncio.to_thread(
+                self.position_service.get_open_positions
+            )
+        except Exception as error:
+            await update.message.reply_text(f"❌ Ошибка: {error}")
+            return
+        if not positions:
+            await update.message.reply_text("Открытых позиций нет")
+            return
+        keyboard = [
+            [InlineKeyboardButton(
+                (
+                    f"❌ {position.side} {position.symbol} | "
+                    f"{position.quantity} | "
+                    f"PnL {position.unrealized_pnl}"
+                ),
+                callback_data=(
+                    f"manage:select_position:{position.position_id}"
+                ),
+            )]
+            for position in positions
+        ]
+        await update.message.reply_text(
+            "Какую позицию закрыть полностью?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    async def _propose_position_close(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        position,
+        *,
+        edit: bool = False,
+    ) -> None:
+        proposal = ManagementProposal.create(
+            ManagementAction.CLOSE_POSITION,
+            position.position_id,
+            symbol=position.symbol.upper(),
+        )
         ManagementProposalService.store(context.user_data, proposal)
+        text = (
+            "Полностью закрыть позицию?\n"
+            f"Символ: {position.symbol}\n"
+            f"Сторона: {position.side}\n"
+            f"Объём: {position.quantity}\n"
+            f"Средняя цена входа: {position.average_open_price}\n"
+            f"Нереализованный PnL: {position.unrealized_pnl}\n"
+            f"ID: {position.position_id}"
+        )
         await self._send_management_confirmation(
             update,
             proposal,
-            f"Закрыть позицию {proposal.target_id}?",
+            text,
+            edit=edit,
         )
 
     async def _send_management_confirmation(
@@ -847,6 +1027,8 @@ class FuturesBot:
         update: Update,
         proposal: ManagementProposal,
         text: str,
+        *,
+        edit: bool = False,
     ) -> None:
         keyboard = [[
             InlineKeyboardButton(
@@ -858,10 +1040,14 @@ class FuturesBot:
                 callback_data=f"manage:cancel:{proposal.proposal_id}",
             ),
         ]]
-        await update.message.reply_text(
-            f"{text}\nПодтвердите в течение 5 минут.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        kwargs = {
+            "text": f"{text}\nПодтвердите в течение 5 минут.",
+            "reply_markup": InlineKeyboardMarkup(keyboard),
+        }
+        if edit:
+            await update.callback_query.edit_message_text(**kwargs)
+        else:
+            await update.message.reply_text(**kwargs)
 
     async def management_button_handler(
         self,
@@ -873,16 +1059,77 @@ class FuturesBot:
         query = update.callback_query
         await query.answer()
         try:
-            prefix, decision, proposal_id = query.data.split(":", 2)
-            if prefix != "manage" or decision not in {"confirm", "cancel"}:
+            prefix, decision, target_id = query.data.split(":", 2)
+            if prefix != "manage" or decision not in {
+                "select_order",
+                "select_position",
+                "confirm",
+                "cancel",
+            }:
                 raise ValueError
         except ValueError:
             await query.edit_message_text("❌ Некорректная кнопка")
             return
+        if decision == "select_order":
+            try:
+                orders = await asyncio.to_thread(
+                    self.order_service.get_pending_orders,
+                    None,
+                    target_id,
+                )
+                order = next(
+                    (
+                        item for item in orders
+                        if item.order_id == target_id
+                    ),
+                    None,
+                )
+                if order is None:
+                    await query.edit_message_text(
+                        "⚠️ Ордер уже исполнен, отменён или не найден."
+                    )
+                    return
+                await self._propose_order_cancellation(
+                    update,
+                    context,
+                    order,
+                    edit=True,
+                )
+            except Exception as error:
+                await query.edit_message_text(f"❌ Ошибка: {error}")
+            return
+        if decision == "select_position":
+            try:
+                positions = await asyncio.to_thread(
+                    self.position_service.get_open_positions,
+                    None,
+                    target_id,
+                )
+                position = next(
+                    (
+                        item for item in positions
+                        if item.position_id == target_id
+                    ),
+                    None,
+                )
+                if position is None:
+                    await query.edit_message_text(
+                        "⚠️ Позиция уже закрыта или не найдена."
+                    )
+                    return
+                await self._propose_position_close(
+                    update,
+                    context,
+                    position,
+                    edit=True,
+                )
+            except Exception as error:
+                await query.edit_message_text(f"❌ Ошибка: {error}")
+            return
         try:
             proposal = ManagementProposalService.consume(
                 context.user_data,
-                proposal_id,
+                target_id,
             )
         except ManagementProposalError as error:
             await query.edit_message_text(f"❌ {error}")
@@ -894,6 +1141,21 @@ class FuturesBot:
         await query.edit_message_text("⏳ Выполняю...")
         try:
             if proposal.action is ManagementAction.CANCEL_ORDER:
+                orders = await asyncio.to_thread(
+                    self.order_service.get_pending_orders,
+                    proposal.symbol,
+                    proposal.target_id,
+                )
+                if not any(
+                    order.order_id == proposal.target_id
+                    and order.symbol.upper() == proposal.symbol
+                    for order in orders
+                ):
+                    await query.edit_message_text(
+                        "⚠️ Ордер уже исполнен, отменён или изменился. "
+                        "Отмена не отправлена."
+                    )
+                    return
                 result = await asyncio.to_thread(
                     self.order_service.cancel_orders,
                     proposal.symbol,
@@ -908,6 +1170,21 @@ class FuturesBot:
                     f"✅ Отмена ордера {status}"
                 )
             else:
+                positions = await asyncio.to_thread(
+                    self.position_service.get_open_positions,
+                    proposal.symbol,
+                    proposal.target_id,
+                )
+                if not any(
+                    position.position_id == proposal.target_id
+                    and position.symbol.upper() == proposal.symbol
+                    for position in positions
+                ):
+                    await query.edit_message_text(
+                        "⚠️ Позиция уже закрыта или изменилась. "
+                        "Закрытие не отправлено."
+                    )
+                    return
                 result = await asyncio.to_thread(
                     self.position_service.close_position,
                     proposal.target_id,
@@ -982,10 +1259,10 @@ class FuturesBot:
             )
             status = "симуляция"
         elif plan.order_type == "LIMIT":
-            header = "✅ *Лимитный ордер отправлен!*"
+            header = "✅ *Пакет лимитных ордеров отправлен!*"
             status = "ожидает исполнения"
         else:
-            header = "✅ *Рыночный ордер отправлен!*"
+            header = "✅ *Пакет рыночных ордеров отправлен!*"
             status = "исполнение подтверждается Bitunix"
 
         tp_lines = "\n".join(
@@ -1005,9 +1282,11 @@ class FuturesBot:
             f"{tp_lines}\n"
             f"SL: {result['stop_loss']}\n"
             f"Статус входа: {status}\n"
-            "TP будут добавлены после исполнения входа.\n"
-            "👀 Контроль активен: бот ожидает исполнения "
-            "лимитного ордера и автоматически выставит тейки."
+            "✅ Каждый вход уже отправлен со своим TP и SL.\n"
+            "Защита хранится на Bitunix и не зависит от работы "
+            "бота.\n"
+            "👀 Мониторинг используется для уведомлений, журнала "
+            "и проверки защиты."
         )
 
 
@@ -1028,6 +1307,7 @@ def main():
         builder = builder.connect_timeout(30).read_timeout(30).write_timeout(30)
     
     app = builder.build()
+    app.add_error_handler(telegram_error_handler)
     
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler((filters.TEXT | filters.PHOTO | filters.CAPTION) & ~filters.COMMAND, bot.handle_signal)],

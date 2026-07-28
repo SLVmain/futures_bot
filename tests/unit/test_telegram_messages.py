@@ -1,10 +1,13 @@
 import asyncio
+import logging
 from types import SimpleNamespace
+
+from telegram.error import NetworkError
 
 from models.signal import OrderSide
 from models.trade import PlannedTakeProfit, TradePlan
 from services.trade_journal import CsvTradeJournal, JournalEvent
-from telegram_bot import FuturesBot
+from telegram_bot import FuturesBot, telegram_error_handler
 
 
 def test_limit_order_result_is_explicitly_formatted():
@@ -37,14 +40,15 @@ def test_limit_order_result_is_explicitly_formatted():
 
     message = FuturesBot._format_success_message(plan, result)
 
-    assert "Лимитный ордер отправлен" in message
+    assert "Пакет лимитных ордеров отправлен" in message
     assert "Вход: 0.0155" in message
     assert "Объём: 13356" in message
     assert "TP1: 0.01655 — 13356 (100%)" in message
     assert "SL: 0.014" in message
     assert "Статус входа: ожидает исполнения" in message
-    assert "TP будут добавлены после исполнения" in message
-    assert "Контроль активен" in message
+    assert "Каждый вход уже отправлен со своим TP и SL" in message
+    assert "не зависит от работы бота" in message
+    assert "Мониторинг используется" in message
 
 
 def test_existing_symbol_exposure_warning():
@@ -119,5 +123,25 @@ def test_telegram_trade_reports_and_export(tmp_path):
         exported = export_update.message.documents[0]
         assert exported["filename"] == "trade_journal.csv"
         assert b"TRADE_SUMMARY" in exported["document"].getvalue()
+
+    asyncio.run(scenario())
+
+
+def test_network_error_is_logged_without_sensitive_details(caplog):
+    async def scenario():
+        context = SimpleNamespace(
+            error=NetworkError(
+                "proxy-user:proxy-password@private-host"
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await telegram_error_handler(None, context)
+
+        assert "Telegram временно недоступен" in caplog.text
+        assert "NetworkError" in caplog.text
+        assert "proxy-user" not in caplog.text
+        assert "proxy-password" not in caplog.text
+        assert "private-host" not in caplog.text
 
     asyncio.run(scenario())

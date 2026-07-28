@@ -19,6 +19,13 @@ class ExecutionService:
         self.order_service = order_service
         self.account_service = account_service
 
+    @staticmethod
+    def client_ids(plan: TradePlan) -> tuple[str, ...]:
+        return tuple(
+            f"bot-{plan.execution_id[:20]}-{index}"
+            for index in range(1, len(plan.take_profits) + 1)
+        )
+
     def execute(self, plan: TradePlan) -> TradeExecutionResult:
         if not plan.in_range and plan.limit_price is None:
             return TradeExecutionResult(
@@ -46,60 +53,109 @@ class ExecutionService:
             f"SL: {plan.stop_loss}"
         )
 
-        placed_orders = []
-        failed_orders = []
-        simulated = True
-
-        for index, take_profit in enumerate(
-            plan.take_profits[:1],
+        client_ids = self.client_ids(plan)
+        side = (
+            "BUY"
+            if plan.side is OrderSide.LONG
+            else "SELL"
+        )
+        order_specs = []
+        take_profit_by_client_id = {}
+        for index, (client_id, take_profit) in enumerate(
+            zip(client_ids, plan.take_profits),
             start=1,
         ):
+            spec = {
+                "side": side,
+                "qty": str(take_profit.quantity),
+                "tradeSide": "OPEN",
+                "orderType": plan.order_type,
+                "effect": "GTC",
+                "clientId": client_id,
+                "reduceOnly": False,
+                "tpPrice": str(take_profit.price),
+                "tpStopType": "LAST_PRICE",
+                "tpOrderType": "MARKET",
+                "slPrice": str(plan.stop_loss),
+                "slStopType": "LAST_PRICE",
+                "slOrderType": "MARKET",
+            }
+            if plan.limit_price is not None:
+                spec["price"] = str(plan.limit_price)
+            order_specs.append(spec)
+            take_profit_by_client_id[client_id] = (
+                index,
+                take_profit,
+            )
             print(
-                "   TP будут добавлены после подтверждённого "
-                "исполнения входа"
+                f"   TP{index}: {take_profit.price} | "
+                f"{take_profit.quantity} | SL {plan.stop_loss}"
             )
 
-            method = (
-                self.order_service.open_long
-                if plan.side is OrderSide.LONG
-                else self.order_service.open_short
+        try:
+            batch_result = self.order_service.place_batch_orders(
+                plan.symbol,
+                tuple(order_specs),
             )
-            try:
-                result = method(
-                    symbol=plan.symbol,
-                    quantity=plan.total_quantity,
-                    price=plan.limit_price,
-                    sl_price=plan.stop_loss,
-                    tp_price=None,
-                    client_id=(
-                        f"bot-{plan.execution_id[:20]}-{index}"
-                    ),
-                )
-            except BitunixError as error:
-                failed_orders.append(
+        except BitunixError as error:
+            return TradeExecutionResult(
+                success=False,
+                failed_orders=tuple(
                     FailedOrder(index, str(error))
-                )
-                break
-
-            if result.success:
-                order_id = result.order_id or "unknown"
-                simulated = simulated and result.simulated
-                print(f"   ✅ ID: {order_id}")
-                placed_orders.append(
-                    PlacedOrder(
-                        tp_number=index,
-                        price=take_profit.price,
-                        quantity=plan.total_quantity,
-                        order_id=order_id,
-                        simulated=result.simulated,
+                    for index in range(
+                        1,
+                        len(plan.take_profits) + 1,
                     )
+                ),
+                error="Не удалось разместить пакет входных ордеров",
+            )
+
+        placed_orders = []
+        for item in batch_result.placed:
+            details = take_profit_by_client_id.get(item.client_id)
+            if details is None:
+                continue
+            index, take_profit = details
+            print(f"   ✅ TP{index} ID: {item.order_id}")
+            placed_orders.append(PlacedOrder(
+                tp_number=index,
+                price=take_profit.price,
+                quantity=take_profit.quantity,
+                order_id=item.order_id,
+                simulated=batch_result.simulated,
+            ))
+        placed_orders.sort(key=lambda item: item.tp_number)
+
+        failed_orders = []
+        for item in batch_result.failed:
+            details = take_profit_by_client_id.get(item.client_id)
+            if details is None:
+                continue
+            index, _ = details
+            error = ": ".join(
+                part
+                for part in (
+                    item.error_code,
+                    item.error_message,
                 )
-            else:
-                print(f"   ❌ {result.message}")
-                failed_orders.append(
-                    FailedOrder(index, result.message)
-                )
-                break
+                if part
+            ) or "Bitunix отклонил ордер"
+            failed_orders.append(FailedOrder(index, error))
+        reported_client_ids = {
+            item.client_id for item in batch_result.placed
+        } | {
+            item.client_id for item in batch_result.failed
+        }
+        for client_id, (index, _) in (
+            take_profit_by_client_id.items()
+        ):
+            if client_id not in reported_client_ids:
+                failed_orders.append(FailedOrder(
+                    index,
+                    "Bitunix не вернул результат для части ордера",
+                ))
+        failed_orders.sort(key=lambda item: item.tp_number)
+        simulated = batch_result.simulated
 
         if not placed_orders:
             return TradeExecutionResult(
@@ -117,7 +173,10 @@ class ExecutionService:
                 error="Позиция открыта частично",
             )
 
-        print(f"\n✅ Размещено: {len(placed_orders)} ордеров")
+        print(
+            f"\n✅ Размещено защищённых частей: "
+            f"{len(placed_orders)}"
+        )
         return TradeExecutionResult(
             success=True,
             orders=tuple(placed_orders),

@@ -222,6 +222,78 @@ class OrderResult:
 
 
 @dataclass(frozen=True)
+class BatchPlacedOrder:
+    order_id: str
+    client_id: str
+
+
+@dataclass(frozen=True)
+class BatchOrderFailure:
+    client_id: str
+    error_code: str
+    error_message: str
+
+
+@dataclass(frozen=True)
+class BatchOrderResult:
+    placed: tuple[BatchPlacedOrder, ...]
+    failed: tuple[BatchOrderFailure, ...]
+    simulated: bool = False
+
+    @classmethod
+    def from_response(cls, response: dict) -> "BatchOrderResult":
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise BitunixResponseError(
+                "Batch order data must be an object"
+            )
+        success_list = data.get("successList", [])
+        failure_list = data.get("failureList", [])
+        if not isinstance(success_list, list) or not isinstance(
+            failure_list,
+            list,
+        ):
+            raise BitunixResponseError(
+                "Batch order result lists are invalid"
+            )
+
+        placed = []
+        for item in success_list:
+            if not isinstance(item, dict):
+                raise BitunixResponseError(
+                    "Batch order success item is invalid"
+                )
+            order_id = item.get("orderId", item.get("id"))
+            client_id = item.get("clientId")
+            if not order_id or not client_id:
+                raise BitunixResponseError(
+                    "Batch order success identity is missing"
+                )
+            placed.append(BatchPlacedOrder(
+                order_id=str(order_id),
+                client_id=str(client_id),
+            ))
+
+        failed = []
+        for item in failure_list:
+            if not isinstance(item, dict) or not item.get("clientId"):
+                raise BitunixResponseError(
+                    "Batch order failure identity is missing"
+                )
+            failed.append(BatchOrderFailure(
+                client_id=str(item["clientId"]),
+                error_code=str(item.get("errorCode", "")),
+                error_message=str(item.get("errorMsg", "")),
+            ))
+
+        return cls(
+            placed=tuple(placed),
+            failed=tuple(failed),
+            simulated=bool(response.get("simulated", False)),
+        )
+
+
+@dataclass(frozen=True)
 class OpenPosition:
     position_id: str
     symbol: str

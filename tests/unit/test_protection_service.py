@@ -53,6 +53,60 @@ def test_detects_missing_stop_loss():
     )
 
 
+def test_partial_protection_must_cover_position_quantity():
+    service = ProtectionService(None)
+    position = make_position()
+    protections = (
+        {
+            "positionId": position.position_id,
+            "tpPrice": "55",
+            "tpQty": "0.5",
+            "slPrice": "45",
+            "slQty": "0.5",
+        },
+        {
+            "positionId": position.position_id,
+            "tpPrice": "60",
+            "tpQty": "0.5",
+            "slPrice": "45",
+            "slQty": "0.4",
+        },
+    )
+
+    result = service.unprotected_positions(
+        (position,),
+        protections,
+    )
+
+    assert result == ((position, ("SL",)),)
+
+
+def test_partial_protection_covering_position_is_accepted():
+    service = ProtectionService(None)
+    position = make_position()
+    protections = (
+        {
+            "positionId": position.position_id,
+            "tpPrice": "55",
+            "tpQty": "0.5",
+            "slPrice": "45",
+            "slQty": "0.5",
+        },
+        {
+            "positionId": position.position_id,
+            "tpPrice": "60",
+            "tpQty": "0.5",
+            "slPrice": "45",
+            "slQty": "0.5",
+        },
+    )
+
+    assert service.unprotected_positions(
+        (position,),
+        protections,
+    ) == ()
+
+
 def test_fee_aware_break_even_includes_paid_costs():
     long_position = SimpleNamespace(
         average_open_price="50",

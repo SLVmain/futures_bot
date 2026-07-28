@@ -3,6 +3,7 @@ import pytest
 from services.order_service import OrderService
 from tests.fixtures.bitunix_responses import ORDER_ERROR, ORDER_SUCCESS
 from tests.fixtures.bitunix_responses import (
+    BATCH_ORDER_PARTIAL,
     CANCEL_ORDERS_SUCCESS,
     PENDING_ORDERS_SUCCESS,
 )
@@ -65,6 +66,52 @@ def test_open_short_uses_sell_side():
 
     assert client.calls[0][2]["side"] == "SELL"
     assert client.calls[0][2]["tradeSide"] == "OPEN"
+
+
+def test_place_batch_orders_parses_partial_result():
+    client = FakeClient(BATCH_ORDER_PARTIAL)
+    orders = (
+        {
+            "clientId": "client-1",
+            "side": "BUY",
+            "qty": "0.6",
+        },
+        {
+            "clientId": "client-2",
+            "side": "BUY",
+            "qty": "0.4",
+        },
+    )
+
+    result = OrderService(client).place_batch_orders(
+        "BTCUSDT",
+        orders,
+    )
+
+    assert result.placed[0].order_id == "batch-1"
+    assert result.placed[0].client_id == "client-1"
+    assert result.failed[0].client_id == "client-2"
+    assert result.failed[0].error_code == "10012"
+    assert client.calls == [(
+        "/api/v1/futures/trade/batch_order",
+        "",
+        {
+            "symbol": "BTCUSDT",
+            "orderList": list(orders),
+        },
+    )]
+
+
+@pytest.mark.parametrize("orders", ((), ({},) * 6))
+def test_place_batch_orders_validates_size(orders):
+    with pytest.raises(
+        ValueError,
+        match="between 1 and 5 orders",
+    ):
+        OrderService(FakeClient({})).place_batch_orders(
+            "BTCUSDT",
+            orders,
+        )
 
 
 def test_get_pending_orders_builds_query_and_parses_response():

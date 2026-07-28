@@ -61,9 +61,16 @@ class PositionMonitor:
         self._break_even_proposals = {}
         self._pending_plan_notifications: set[str] = set()
 
-    def register_plan(self, client_id: str, plan) -> None:
+    def register_plan(
+        self,
+        client_id: str,
+        plan,
+        *,
+        persist: bool = True,
+    ) -> None:
         self._plans_by_client_id[client_id] = plan
-        self.journal.save_plan(client_id, plan)
+        if persist:
+            self.journal.save_plan(client_id, plan)
 
     def discard_plan(self, client_id: str) -> None:
         self._plans_by_client_id.pop(client_id, None)
@@ -170,30 +177,35 @@ class PositionMonitor:
         if notification:
             await self.notifier(notification)
         if channel == "order" and status == "FILLED":
-            await self._install_take_profits(data)
+            await self._verify_attached_protections(data)
         if channel == "position" and data.get("event") == "OPEN":
+            checked_execution_ids = set()
             for plan in tuple(
                 self._plans_by_client_id.values()
             ):
-                if plan.symbol == data.get("symbol"):
-                    await self._install_plan(plan)
+                if (
+                    plan.symbol == data.get("symbol")
+                    and plan.execution_id not in checked_execution_ids
+                ):
+                    checked_execution_ids.add(plan.execution_id)
+                    await self._verify_plan_protections(plan)
         if channel == "tpsl" and status == "FILLED":
             await self._request_break_even(data)
 
-    async def _install_take_profits(self, data: dict) -> None:
+    async def _verify_attached_protections(self, data: dict) -> None:
         client_id = str(data.get("clientId", ""))
         plan = self._plans_by_client_id.get(client_id)
         if plan is None:
             return
-        await self._install_plan(plan)
+        await self._verify_plan_protections(plan)
 
-    async def _install_plan(self, plan) -> None:
+    async def _verify_plan_protections(self, plan) -> None:
         position = await self._wait_for_position(plan)
         if position is None:
             await self.notifier(
                 "⚠️ Ордер исполнен, но позиция не появилась "
                 "после повторных проверок. "
-                "TP не выставлены; проверьте Bitunix."
+                "Проверьте вход и прикреплённые TP/SL на Bitunix."
             )
             return
         existing = await asyncio.to_thread(
@@ -234,10 +246,9 @@ class PositionMonitor:
             await self.notifier(
                 "⚠️ Объём активных TP превышает объём позиции: "
                 f"{reserved_quantity} > {position_quantity}. "
-                "Новые TP не будут выставлены."
+                "Мониторинг не будет изменять ордера."
             )
             return
-        placed = 0
         recovered = 0
         failed = False
         used_existing_ids = set()
@@ -313,7 +324,8 @@ class PositionMonitor:
                     f"⚠️ TP{index} по цене {price} уже существует, "
                     "но его объём не совпадает с планом: "
                     f"Bitunix={','.join(map(str, conflicting))}, "
-                    f"план={quantity}. Новый TP не выставлен."
+                    f"план={quantity}. "
+                    "Мониторинг не изменял ордера."
                 )
                 continue
             if (
@@ -322,51 +334,23 @@ class PositionMonitor:
             ):
                 failed = True
                 await self.notifier(
-                    f"⚠️ TP{index} не выставлен: суммарный объём "
+                    f"⚠️ TP{index}: суммарный объём "
                     f"{reserved_quantity + quantity} превышает "
-                    f"остаток позиции {position_quantity}."
+                    f"остаток позиции {position_quantity}. "
+                    "Мониторинг не изменял ордера."
                 )
                 continue
-            try:
-                tp_order_id = await asyncio.to_thread(
-                    self.protections.place_take_profit,
-                    plan.symbol,
-                    position.position_id,
-                    take_profit.price,
-                    take_profit.quantity,
-                )
-                self.journal.save_tp_order(
-                    tp_order_id,
-                    position.position_id,
-                    client_id,
-                    index,
-                )
-                if index == 1:
-                    self._tp1_order_positions[tp_order_id] = (
-                        position.position_id
-                    )
-                self._tp_orders[tp_order_id] = (
-                    position.position_id,
-                    index,
-                )
-                placed += 1
-                reserved_quantity += quantity
-            except Exception as error:
-                failed = True
-                await self.notifier(
-                    "⚠️ Не удалось выставить TP "
-                    f"{take_profit.price}: "
-                    f"{type(error).__name__}: {error}. "
-                    "Проверьте позицию на Bitunix."
-                )
-        if placed:
+            failed = True
             await self.notifier(
-                f"✅ Добавлено частичных TP: {placed}; "
-                f"позиция {position.position_id}"
+                f"⚠️ Прикреплённый TP{index} не найден: "
+                f"цена {take_profit.price}, "
+                f"объём {take_profit.quantity}. "
+                "Мониторинг не создаёт ордера автоматически; "
+                "проверьте Bitunix."
             )
         if recovered:
             await self.notifier(
-                f"✅ Восстановлены ID существующих TP: {recovered}; "
+                f"✅ Проверены прикреплённые TP: {recovered}; "
                 "контроль TP1 активен"
             )
         if not failed:
@@ -520,11 +504,23 @@ class PositionMonitor:
         if not stop_orders:
             raise ValueError("Активный SL не найден")
         for stop_order in stop_orders:
+            stop_quantity = (
+                stop_order.get("slQty")
+                or stop_order.get("qty")
+            )
+            if not stop_quantity:
+                if len(stop_orders) == 1:
+                    stop_quantity = position.quantity
+                else:
+                    raise ValueError(
+                        "Bitunix не вернул объём частичного SL; "
+                        "перенос остановлен"
+                    )
             await asyncio.to_thread(
                 self.protections.modify_stop_loss,
                 str(stop_order["id"]),
                 str(break_even),
-                position.quantity,
+                stop_quantity,
             )
         await asyncio.to_thread(
             self.journal.append,
@@ -575,9 +571,20 @@ class PositionMonitor:
                 f"ID {position.position_id}. "
                 f"Отсутствует: {', '.join(missing)}"
             )
+        checked_execution_ids = set()
         for client_id, plan in tuple(
             self._plans_by_client_id.items()
         ):
+            if plan.execution_id in checked_execution_ids:
+                continue
+            checked_execution_ids.add(plan.execution_id)
+            position_visible = any(
+                position.symbol == plan.symbol
+                and position.side == plan.side.value
+                for position in positions
+            )
+            if position_visible:
+                await self._verify_plan_protections(plan)
             pending_order = next(
                 (
                     order
@@ -594,15 +601,7 @@ class PositionMonitor:
                     client_id,
                 )
                 status = str(detail.get("status", "")).rstrip("_")
-            if status == "FILLED":
-                position_visible = any(
-                    position.symbol == plan.symbol
-                    and position.side == plan.side.value
-                    for position in positions
-                )
-                if position_visible:
-                    await self._install_plan(plan)
-            elif status in {"CANCELED", "PART_FILLED_CANCELED"}:
+            if status in {"CANCELED", "PART_FILLED_CANCELED"}:
                 self.discard_plan(client_id)
             elif (
                 status in {"INIT", "NEW", "PART_FILLED"}
@@ -614,9 +613,9 @@ class PositionMonitor:
                     f"{plan.side.value} {plan.symbol}\n"
                     f"Цена входа: {plan.planned_entry_price}\n"
                     f"Запланировано TP: {len(plan.take_profits)}\n\n"
-                    "Бот ожидает исполнения входного ордера. "
-                    "После исполнения тейки будут выставлены "
-                    "автоматически."
+                    "TP и SL уже прикреплены на стороне Bitunix. "
+                    "Бот ожидает исполнение только для уведомлений "
+                    "и проверки защиты."
                 )
 
     async def _notification(

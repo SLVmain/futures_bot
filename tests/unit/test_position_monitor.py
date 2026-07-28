@@ -296,7 +296,7 @@ def test_reconciliation_reports_active_limit_order_once(tmp_path):
             if "Контроль лимитного входа активен" in message
         ]
         assert len(waiting_messages) == 1
-        assert "После исполнения тейки будут выставлены" in (
+        assert "TP и SL уже прикреплены на стороне Bitunix" in (
             waiting_messages[0]
         )
 
@@ -360,7 +360,7 @@ def test_reconciliation_does_not_claim_fill_without_position(tmp_path):
     asyncio.run(scenario())
 
 
-def test_filled_entry_adds_all_partial_take_profits(tmp_path):
+def test_filled_entry_only_verifies_attached_take_profits(tmp_path):
     async def scenario():
         notifications = []
         monitor = make_monitor(tmp_path, notifications)
@@ -401,12 +401,16 @@ def test_filled_entry_adds_all_partial_take_profits(tmp_path):
             },
         })
 
-        assert monitor.protections.placed == [
-            ("BTCUSDT", "position-1", 60, 0.6),
-            ("BTCUSDT", "position-1", 65, 0.4),
-        ]
-        assert "Добавлено частичных TP: 2" in notifications[-2]
-        assert "Восстановлены ID существующих TP: 1" in notifications[-1]
+        assert monitor.protections.placed == []
+        assert any(
+            "Прикреплённый TP2 не найден" in message
+            for message in notifications
+        )
+        assert any(
+            "Прикреплённый TP3 не найден" in message
+            for message in notifications
+        )
+        assert "Проверены прикреплённые TP: 1" in notifications[-1]
         assert monitor._tp1_order_positions == {
             "tp-existing": "position-1",
         }
@@ -466,7 +470,7 @@ def test_filled_entry_retries_until_position_is_visible(tmp_path):
         })
 
         assert monitor.positions.calls == 3
-        assert len(monitor.protections.placed) == 2
+        assert monitor.protections.placed == []
         assert not any(
             "позиция не появилась" in message
             for message in notifications
@@ -497,7 +501,7 @@ def test_filled_entry_warns_after_position_retries(tmp_path):
         )
         monitor.register_plan("client-1", plan)
 
-        await monitor._install_plan(plan)
+        await monitor._verify_plan_protections(plan)
 
         assert monitor.positions.calls == 3
         assert monitor.protections.placed == []
@@ -517,11 +521,12 @@ def test_existing_tp_must_match_position_and_quantity(tmp_path):
             "tpQty": "1",
         }]
 
-        await monitor._install_plan(make_single_tp_plan())
+        await monitor._verify_plan_protections(
+            make_single_tp_plan()
+        )
 
-        assert monitor.protections.placed == [
-            ("BTCUSDT", "position-1", 55, 1),
-        ]
+        assert monitor.protections.placed == []
+        assert "Прикреплённый TP1 не найден" in notifications[-1]
         assert "other-position-tp" not in (
             monitor._tp1_order_positions
         )
@@ -534,7 +539,9 @@ def test_existing_tp_must_match_position_and_quantity(tmp_path):
             "tpQty": "0.5",
         }]
 
-        await monitor._install_plan(make_single_tp_plan())
+        await monitor._verify_plan_protections(
+            make_single_tp_plan()
+        )
 
         assert monitor.protections.placed == []
         assert "объём не совпадает" in notifications[-1]
@@ -553,7 +560,7 @@ def test_new_tp_cannot_exceed_remaining_position(tmp_path):
             "tpQty": "0.8",
         }]
 
-        await monitor._install_plan(
+        await monitor._verify_plan_protections(
             make_single_tp_plan(quantity=0.3)
         )
 
@@ -574,13 +581,15 @@ def test_tp_quantity_comparison_allows_decimal_noise(tmp_path):
             "tpQty": "1.0000000001",
         }]
 
-        await monitor._install_plan(make_single_tp_plan())
+        await monitor._verify_plan_protections(
+            make_single_tp_plan()
+        )
 
         assert monitor.protections.placed == []
         assert monitor._tp1_order_positions == {
             "existing-tp": "position-1",
         }
-        assert "Восстановлены ID существующих TP: 1" in (
+        assert "Проверены прикреплённые TP: 1" in (
             notifications[-1]
         )
 
@@ -598,13 +607,15 @@ def test_total_tp_quantity_allows_only_tiny_decimal_noise(tmp_path):
             "tpQty": "0.7000000001",
         }]
 
-        await monitor._install_plan(
+        await monitor._verify_plan_protections(
             make_single_tp_plan(quantity=0.3)
         )
 
-        assert monitor.protections.placed == [
-            ("BTCUSDT", "position-1", 55, 0.3),
-        ]
+        assert monitor.protections.placed == []
+        assert any(
+            "Прикреплённый TP1 не найден" in message
+            for message in notifications
+        )
         assert not any(
             "превышает остаток позиции" in message
             for message in notifications
@@ -655,6 +666,39 @@ def test_tp1_fill_requests_confirmation_before_moving_stop(tmp_path):
             ("sl-1", "50.03001803", "1")
         ]
         assert "50.03001803" in result
+
+    asyncio.run(scenario())
+
+
+def test_break_even_preserves_each_partial_stop_quantity(tmp_path):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        monitor._tp1_order_positions["tp-1"] = "position-1"
+        monitor.protections.pending = [
+            {
+                "id": "sl-2",
+                "positionId": "position-1",
+                "slPrice": "45",
+                "slQty": "0.6",
+            },
+            {
+                "id": "sl-3",
+                "positionId": "position-1",
+                "slPrice": "45",
+                "slQty": "0.4",
+            },
+        ]
+
+        await monitor._request_break_even({"orderId": "tp-1"})
+        proposal_id = next(iter(monitor._break_even_proposals))
+
+        await monitor.confirm_break_even(proposal_id, True)
+
+        assert monitor.protections.modified == [
+            ("sl-2", "50.03001803", "0.6"),
+            ("sl-3", "50.03001803", "0.4"),
+        ]
 
     asyncio.run(scenario())
 

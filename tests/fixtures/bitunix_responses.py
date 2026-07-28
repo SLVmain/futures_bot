@@ -76,6 +76,23 @@ ORDER_ERROR = {
     "msg": "Invalid request",
 }
 
+BATCH_ORDER_PARTIAL = {
+    "code": 0,
+    "data": {
+        "successList": [
+            {"id": "batch-1", "clientId": "client-1"},
+        ],
+        "failureList": [
+            {
+                "clientId": "client-2",
+                "errorCode": "10012",
+                "errorMsg": "Insufficient balance",
+            },
+        ],
+    },
+    "msg": "Success",
+}
+
 OPEN_POSITIONS_SUCCESS = {
     "code": 0,
     "data": [

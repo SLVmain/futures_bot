@@ -2,6 +2,7 @@ from urllib.parse import urlencode
 
 from core.api_client import BitunixClient
 from core.api_models import (
+    BatchOrderResult,
     CancelOrdersResult,
     OrderResult,
     PendingOrder,
@@ -101,6 +102,27 @@ class OrderService:
             tp_price=tp_price,
             client_id=client_id,
         )
+
+    def place_batch_orders(
+        self,
+        symbol: str,
+        orders: tuple[dict, ...],
+    ) -> BatchOrderResult:
+        if not symbol:
+            raise ValueError("symbol is required")
+        if not 1 <= len(orders) <= 5:
+            raise ValueError(
+                "batch must contain between 1 and 5 orders"
+            )
+        response = self.client.post(
+            "/api/v1/futures/trade/batch_order",
+            "",
+            {
+                "symbol": symbol,
+                "orderList": list(orders),
+            },
+        )
+        return BatchOrderResult.from_response(response)
 
     def get_pending_orders(
         self,

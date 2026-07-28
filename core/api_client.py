@@ -170,6 +170,25 @@ class BitunixClient:
                 "msg": "DRY_RUN: order was not sent to Bitunix",
                 "simulated": True,
             }
+        if endpoint == "/api/v1/futures/trade/batch_order":
+            order_list = (body or {}).get("orderList", [])
+            return {
+                "code": 0,
+                "data": {
+                    "successList": [
+                        {
+                            "id": f"dry-run-{uuid4().hex}",
+                            "clientId": order.get("clientId", ""),
+                        }
+                        for order in order_list
+                    ],
+                    "failureList": [],
+                },
+                "msg": (
+                    "DRY_RUN: batch orders were not sent to Bitunix"
+                ),
+                "simulated": True,
+            }
         if endpoint == "/api/v1/futures/trade/cancel_orders":
             order_list = (body or {}).get("orderList", [])
             return {

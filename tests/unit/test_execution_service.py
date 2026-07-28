@@ -1,4 +1,8 @@
-from core.api_models import OrderResult
+from core.api_models import (
+    BatchOrderFailure,
+    BatchOrderResult,
+    BatchPlacedOrder,
+)
 from models.signal import OrderSide
 from models.trade import PlannedTakeProfit, TradePlan
 from services.execution_service import ExecutionService
@@ -8,13 +12,17 @@ class FakeOrderService:
     def __init__(self):
         self.calls = []
 
-    def open_long(self, **kwargs):
-        self.calls.append(kwargs)
-        return OrderResult(
-            code=0,
-            message="DRY_RUN",
-            order_id=f"order-{len(self.calls)}",
-            client_id=None,
+    def place_batch_orders(self, symbol, orders):
+        self.calls.append((symbol, orders))
+        return BatchOrderResult(
+            placed=tuple(
+                BatchPlacedOrder(
+                    order_id=f"order-{index}",
+                    client_id=order["clientId"],
+                )
+                for index, order in enumerate(orders, start=1)
+            ),
+            failed=(),
             simulated=True,
         )
 
@@ -28,13 +36,20 @@ class FakeAccountService:
 
 
 class PartiallyFailingOrderService(FakeOrderService):
-    def open_long(self, **kwargs):
-        self.calls.append(kwargs)
-        return OrderResult(
-            code=10001,
-            message="Rejected",
-            order_id=None,
-            client_id=kwargs["client_id"],
+    def place_batch_orders(self, symbol, orders):
+        self.calls.append((symbol, orders))
+        return BatchOrderResult(
+            placed=(
+                BatchPlacedOrder("order-1", orders[0]["clientId"]),
+            ),
+            failed=tuple(
+                BatchOrderFailure(
+                    order["clientId"],
+                    "10001",
+                    "Rejected",
+                )
+                for order in orders[1:]
+            ),
             simulated=False,
         )
 
@@ -69,13 +84,24 @@ def test_executes_existing_plan_without_market_lookup():
 
     assert result.success is True
     assert result.simulated is True
-    assert len(result.orders) == 1
-    assert [call["quantity"] for call in orders.calls] == [2]
-    assert orders.calls[0]["tp_price"] is None
-    assert orders.calls[0]["sl_price"] == 45
-    assert [call["client_id"] for call in orders.calls] == [
-        f"bot-{plan.execution_id[:20]}-1",
+    assert len(result.orders) == 3
+    assert len(orders.calls) == 1
+    symbol, batch = orders.calls[0]
+    assert symbol == "BTCUSDT"
+    assert [item["qty"] for item in batch] == ["1", "0.5", "0.5"]
+    assert [item["tpPrice"] for item in batch] == [
+        "55",
+        "60",
+        "65",
     ]
+    assert [item["slPrice"] for item in batch] == ["45", "45", "45"]
+    assert [item["clientId"] for item in batch] == [
+        f"bot-{plan.execution_id[:20]}-1",
+        f"bot-{plan.execution_id[:20]}-2",
+        f"bot-{plan.execution_id[:20]}-3",
+    ]
+    assert all(item["orderType"] == "MARKET" for item in batch)
+    assert all("price" not in item for item in batch)
     assert account.calls == [("BTCUSDT", 10)]
 
 
@@ -104,21 +130,24 @@ def test_outside_range_executes_limit_order_at_planned_price():
     result = ExecutionService(orders).execute(plan)
 
     assert result.success is True
-    assert orders.calls[0]["price"] == 50
-    assert orders.calls[0]["quantity"] == plan.total_quantity
+    _, batch = orders.calls[0]
+    assert all(item["price"] == "50" for item in batch)
+    assert [item["qty"] for item in batch] == ["1", "0.5", "0.5"]
+    assert all(item["orderType"] == "LIMIT" for item in batch)
 
 
-def test_first_order_failure_is_not_partial():
+def test_batch_partial_failure_reports_every_rejected_part():
     orders = PartiallyFailingOrderService()
 
     result = ExecutionService(orders).execute(make_plan())
     data = result.to_dict()
 
-    assert result.status == "FAILED"
+    assert result.status == "PARTIAL"
     assert data["success"] is False
-    assert data["partial"] is False
-    assert len(data["orders"]) == 0
+    assert data["partial"] is True
+    assert len(data["orders"]) == 1
     assert data["failed_orders"] == [
-        {"tp": 1, "error": "Rejected"}
+        {"tp": 2, "error": "10001: Rejected"},
+        {"tp": 3, "error": "10001: Rejected"},
     ]
     assert len(orders.calls) == 1

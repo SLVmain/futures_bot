@@ -156,6 +156,33 @@ class ProtectionService:
         positions,
         protections: tuple[dict, ...],
     ) -> tuple[tuple[object, tuple[str, ...]], ...]:
+        tolerance = Decimal("0.000000001")
+
+        def covers_position(
+            matching: list[dict],
+            price_field: str,
+            quantity_field: str,
+            position_quantity: Decimal,
+        ) -> bool:
+            protected = [
+                item for item in matching if item.get(price_field)
+            ]
+            if not protected:
+                return False
+            total = Decimal("0")
+            for item in protected:
+                raw_quantity = item.get(quantity_field)
+                if raw_quantity in (None, "", "0", 0):
+                    return True
+                try:
+                    quantity = Decimal(str(raw_quantity))
+                except (ArithmeticError, ValueError):
+                    return False
+                if quantity <= 0:
+                    return True
+                total += quantity
+            return total + tolerance >= position_quantity
+
         result = []
         for position in positions:
             matching = [
@@ -164,10 +191,24 @@ class ProtectionService:
                 if str(item.get("positionId", ""))
                 == position.position_id
             ]
+            try:
+                position_quantity = Decimal(str(position.quantity))
+            except (ArithmeticError, ValueError):
+                position_quantity = Decimal("Infinity")
             missing = []
-            if not any(item.get("tpPrice") for item in matching):
+            if not covers_position(
+                matching,
+                "tpPrice",
+                "tpQty",
+                position_quantity,
+            ):
                 missing.append("TP")
-            if not any(item.get("slPrice") for item in matching):
+            if not covers_position(
+                matching,
+                "slPrice",
+                "slQty",
+                position_quantity,
+            ):
                 missing.append("SL")
             if missing:
                 result.append((position, tuple(missing)))

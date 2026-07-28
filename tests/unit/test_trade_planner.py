@@ -301,6 +301,48 @@ def test_outside_range_creates_limit_plan_at_midpoint():
     assert plan.estimated_stop_loss == 10
 
 
+@pytest.mark.parametrize(
+    ("side", "current_price", "stop_loss", "take_profits"),
+    (
+        (OrderSide.LONG, 40, 45, [55, 60, 65]),
+        (OrderSide.SHORT, 60, 55, [45, 40, 35]),
+    ),
+)
+def test_rejects_limit_entry_that_can_execute_immediately(
+    side,
+    current_price,
+    stop_loss,
+    take_profits,
+):
+    with pytest.raises(
+        TradePlanningError,
+        match=r"нужен Trigger/Stop-Limit; ордер не отправлен",
+    ):
+        make_planner(price=current_price).create_plan(
+            make_signal(
+                side=side,
+                stop_loss=stop_loss,
+                take_profits=take_profits,
+            ),
+            AccountBalance("USDT", "1000"),
+        )
+
+
+def test_short_limit_above_market_remains_allowed():
+    plan = make_planner(price=40).create_plan(
+        make_signal(
+            side=OrderSide.SHORT,
+            stop_loss=55,
+            take_profits=[45, 40, 35],
+        ),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.order_type == "LIMIT"
+    assert plan.limit_price == 50
+    assert plan.limit_price > plan.current_price
+
+
 def test_inside_range_creates_market_plan():
     plan = make_planner(price=50).create_plan(
         make_signal(),
@@ -325,6 +367,40 @@ def test_five_take_profits_use_configured_distribution():
         0.3,
         0.2,
         0.2,
+    ]
+    assert sum(
+        item.quantity for item in plan.take_profits
+    ) == plan.total_quantity
+
+
+def test_rounding_remainder_is_distributed_between_take_profits():
+    instrument = TradingPair(
+        symbol="AAVEUSDT",
+        min_trade_volume="0.1",
+        max_market_order_volume="50000",
+        base_precision=1,
+        quote_precision=2,
+        min_leverage=1,
+        max_leverage=125,
+        symbol_status="OPEN",
+        api_supported=True,
+    )
+
+    plan = make_planner(
+        max_tp_count=5,
+        instrument=instrument,
+    ).create_plan(
+        make_signal(take_profits=[55, 60, 65, 70, 75]),
+        AccountBalance("USDT", "650"),
+    )
+
+    assert plan.total_quantity == 1.3
+    assert [item.quantity for item in plan.take_profits] == [
+        0.5,
+        0.3,
+        0.2,
+        0.2,
+        0.1,
     ]
     assert sum(
         item.quantity for item in plan.take_profits

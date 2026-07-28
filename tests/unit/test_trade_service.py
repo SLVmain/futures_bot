@@ -1,8 +1,9 @@
 from config.settings import TradeSettings
 from core.api_models import (
     AccountBalance,
+    BatchOrderResult,
+    BatchPlacedOrder,
     MarketTicker,
-    OrderResult,
     TradingPair,
 )
 from models.signal import OrderSide, TradeSignal
@@ -37,12 +38,16 @@ class FixedMarket:
 
 
 class SimulatedOrderService:
-    def open_long(self, **kwargs):
-        return OrderResult(
-            code=0,
-            message="DRY_RUN",
-            order_id="dry-run-order",
-            client_id=None,
+    def place_batch_orders(self, symbol, orders):
+        return BatchOrderResult(
+            placed=tuple(
+                BatchPlacedOrder(
+                    f"dry-run-{index}",
+                    order["clientId"],
+                )
+                for index, order in enumerate(orders, start=1)
+            ),
+            failed=(),
             simulated=True,
         )
 

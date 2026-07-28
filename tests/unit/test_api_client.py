@@ -114,6 +114,34 @@ def test_dry_run_simulates_cancel_orders(monkeypatch):
     ]
 
 
+def test_dry_run_simulates_batch_orders(monkeypatch):
+    monkeypatch.setattr(
+        "core.api_client.requests.request",
+        lambda *args, **kwargs: pytest.fail(
+            "HTTP must not run in dry-run"
+        ),
+    )
+    client = BitunixClient(None, None)
+
+    result = client.post(
+        "/api/v1/futures/trade/batch_order",
+        body={
+            "symbol": "BTCUSDT",
+            "orderList": [
+                {"clientId": "client-1"},
+                {"clientId": "client-2"},
+            ],
+        },
+    )
+
+    assert result["simulated"] is True
+    assert [
+        item["clientId"]
+        for item in result["data"]["successList"]
+    ] == ["client-1", "client-2"]
+    assert result["data"]["failureList"] == []
+
+
 def test_post_signs_and_sends_the_same_compact_json():
     calls = []
 

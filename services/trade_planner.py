@@ -173,7 +173,8 @@ class TradePlanner:
         entry_max = max(signal.entry_min, signal.entry_max)
         in_range = entry_min <= current_price <= entry_max
         limit_price = None
-        planned_entry = Decimal(str(current_price))
+        market_price = Decimal(str(current_price))
+        planned_entry = market_price
         if not in_range:
             planned_entry = (
                 (
@@ -182,6 +183,22 @@ class TradePlanner:
                 )
                 / Decimal("2")
             ).quantize(price_step, rounding=ROUND_HALF_UP)
+            immediately_executable = (
+                signal.side is OrderSide.LONG
+                and planned_entry >= market_price
+            ) or (
+                signal.side is OrderSide.SHORT
+                and planned_entry <= market_price
+            )
+            if immediately_executable:
+                raise TradePlanningError(
+                    "Автоматический вход заблокирован: обычный "
+                    f"{signal.side.value} LIMIT по цене "
+                    f"{planned_entry} при текущей цене Bitunix "
+                    f"{current_price} может исполниться немедленно. "
+                    "Для такого входа нужен Trigger/Stop-Limit; "
+                    "ордер не отправлен"
+                )
             limit_price = float(planned_entry)
 
         quantity, risk_budget = self._position_metrics(
@@ -209,10 +226,33 @@ class TradePlanner:
         quantity_step = Decimal("1").scaleb(
             -instrument.base_precision
         )
-        remaining = quantity
+        total_steps = int(quantity / quantity_step)
+        exact_steps = [
+            Decimal(total_steps) * Decimal(share) / Decimal("100")
+            for share in shares
+        ]
+        allocated_steps = [
+            int(value.to_integral_value(rounding=ROUND_DOWN))
+            for value in exact_steps
+        ]
+        remaining_steps = total_steps - sum(allocated_steps)
+        remainder_priority = sorted(
+            range(len(shares)),
+            key=lambda index: (
+                exact_steps[index] - Decimal(allocated_steps[index]),
+                -index,
+            ),
+            reverse=True,
+        )
+        for index in remainder_priority[:remaining_steps]:
+            allocated_steps[index] += 1
+        tp_quantities = [
+            Decimal(steps) * quantity_step
+            for steps in allocated_steps
+        ]
         planned = []
-        for index, (raw_price, share) in enumerate(
-            zip(selected_prices, shares),
+        for index, (raw_price, tp_quantity) in enumerate(
+            zip(selected_prices, tp_quantities),
             start=1,
         ):
             price = Decimal(str(raw_price)).quantize(
@@ -237,13 +277,6 @@ class TradePlanner:
                     f"цена входа: {planned_entry}; "
                     f"текущая цена Bitunix: {current_price}"
                 )
-            if index == len(shares):
-                tp_quantity = remaining
-            else:
-                tp_quantity = (
-                    quantity * Decimal(share) / Decimal("100")
-                ).quantize(quantity_step, rounding=ROUND_DOWN)
-                remaining -= tp_quantity
             if tp_quantity < Decimal(instrument.min_trade_volume):
                 suggestion = ""
                 if len(selected_prices) > 3:
