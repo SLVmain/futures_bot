@@ -1,0 +1,16 @@
+[Unit]
+Description=Bitunix futures Telegram bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/liudmila/futures_bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:handle-lid-switch --who=futures-bot --why=Keep trading monitor online --mode=block /home/liudmila/futures_bot/.venv/bin/python /home/liudmila/futures_bot/telegram_bot.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
