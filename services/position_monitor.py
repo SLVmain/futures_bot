@@ -59,6 +59,7 @@ class PositionMonitor:
             if tp_number == 1
         }
         self._break_even_proposals = {}
+        self._pending_plan_notifications: set[str] = set()
 
     def register_plan(self, client_id: str, plan) -> None:
         self._plans_by_client_id[client_id] = plan
@@ -577,15 +578,46 @@ class PositionMonitor:
         for client_id, plan in tuple(
             self._plans_by_client_id.items()
         ):
-            detail = await asyncio.to_thread(
-                self.orders.get_order_detail,
-                client_id,
+            pending_order = next(
+                (
+                    order
+                    for order in orders
+                    if order.client_id == client_id
+                ),
+                None,
             )
-            status = str(detail.get("status", ""))
+            if pending_order is not None:
+                status = str(pending_order.status).rstrip("_")
+            else:
+                detail = await asyncio.to_thread(
+                    self.orders.get_order_detail,
+                    client_id,
+                )
+                status = str(detail.get("status", "")).rstrip("_")
             if status == "FILLED":
-                await self._install_plan(plan)
+                position_visible = any(
+                    position.symbol == plan.symbol
+                    and position.side == plan.side.value
+                    for position in positions
+                )
+                if position_visible:
+                    await self._install_plan(plan)
             elif status in {"CANCELED", "PART_FILLED_CANCELED"}:
                 self.discard_plan(client_id)
+            elif (
+                status in {"INIT", "NEW", "PART_FILLED"}
+                and client_id not in self._pending_plan_notifications
+            ):
+                self._pending_plan_notifications.add(client_id)
+                await self.notifier(
+                    "⏳ Контроль лимитного входа активен\n\n"
+                    f"{plan.side.value} {plan.symbol}\n"
+                    f"Цена входа: {plan.planned_entry_price}\n"
+                    f"Запланировано TP: {len(plan.take_profits)}\n\n"
+                    "Бот ожидает исполнения входного ордера. "
+                    "После исполнения тейки будут выставлены "
+                    "автоматически."
+                )
 
     async def _notification(
         self,

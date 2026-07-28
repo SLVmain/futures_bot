@@ -1,6 +1,7 @@
 import asyncio
 import csv
 from dataclasses import replace
+from types import SimpleNamespace
 
 from models.signal import OrderSide
 from models.trade import PlannedTakeProfit, TradePlan
@@ -273,6 +274,88 @@ def test_reconciliation_warns_about_missing_protection(tmp_path):
         await monitor.reconcile()
 
         assert "Отсутствует: SL" in notifications[0]
+
+    asyncio.run(scenario())
+
+
+def test_reconciliation_reports_active_limit_order_once(tmp_path):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        monitor.register_plan("client-1", make_single_tp_plan())
+        monitor.orders.get_order_detail = lambda client_id: {
+            "status": "NEW_",
+        }
+
+        await monitor.reconcile()
+        await monitor.reconcile()
+
+        waiting_messages = [
+            message
+            for message in notifications
+            if "Контроль лимитного входа активен" in message
+        ]
+        assert len(waiting_messages) == 1
+        assert "После исполнения тейки будут выставлены" in (
+            waiting_messages[0]
+        )
+
+    asyncio.run(scenario())
+
+
+def test_pending_order_wins_over_stale_filled_detail(tmp_path):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        monitor.register_plan("client-1", make_single_tp_plan())
+        monitor.orders.get_pending_orders = lambda: (
+            SimpleNamespace(
+                client_id="client-1",
+                status="NEW_",
+            ),
+        )
+        monitor.orders.get_order_detail = lambda client_id: {
+            "status": "FILLED",
+        }
+        monitor.positions.get_open_positions = lambda *args: ()
+        monitor.protections.unprotected_positions = (
+            lambda positions, protections: ()
+        )
+
+        await monitor.reconcile()
+
+        assert any(
+            "Контроль лимитного входа активен" in message
+            for message in notifications
+        )
+        assert not any(
+            "позиция не появилась" in message
+            for message in notifications
+        )
+
+    asyncio.run(scenario())
+
+
+def test_reconciliation_does_not_claim_fill_without_position(tmp_path):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        monitor.register_plan("client-1", make_single_tp_plan())
+        monitor.orders.get_order_detail = lambda client_id: {
+            "status": "FILLED",
+        }
+        monitor.positions.get_open_positions = lambda *args: ()
+        monitor.protections.unprotected_positions = (
+            lambda positions, protections: ()
+        )
+
+        await monitor.reconcile()
+
+        assert not any(
+            "позиция не появилась" in message
+            for message in notifications
+        )
+        assert "client-1" in monitor._plans_by_client_id
 
     asyncio.run(scenario())
 

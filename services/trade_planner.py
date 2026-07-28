@@ -245,8 +245,15 @@ class TradePlanner:
                 ).quantize(quantity_step, rounding=ROUND_DOWN)
                 remaining -= tp_quantity
             if tp_quantity < Decimal(instrument.min_trade_volume):
+                suggestion = ""
+                if len(selected_prices) > 3:
+                    suggestion = (
+                        ". Попробуйте использовать только первые "
+                        "3 тейк-профита"
+                    )
                 raise TradePlanningError(
                     f"Объём TP{index} меньше минимального"
+                    f"{suggestion}"
                 )
             planned.append(PlannedTakeProfit(
                 price=float(price),

@@ -1,8 +1,15 @@
 import os
 import asyncio
+import sys
+from dataclasses import replace
 from io import BytesIO
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 from core.api_client import BitunixClient
 from services.account_service import AccountService
@@ -75,6 +82,20 @@ class FuturesBot:
         )
 
     async def post_init(self, application: Application) -> None:
+        await application.bot.set_my_commands([
+            BotCommand("start", "Начать работу и отправить сигнал"),
+            BotCommand("help", "Подсказка по командам"),
+            BotCommand("mode", "Показать режим торговли"),
+            BotCommand("positions", "Открытые позиции"),
+            BotCommand("orders", "Активные ордера"),
+            BotCommand("trades", "Последние сделки журнала"),
+            BotCommand("stats", "Статистика торговли"),
+            BotCommand("export", "Скачать журнал сделок"),
+            BotCommand("cancel_order", "Отменить ордер"),
+            BotCommand("close_position", "Закрыть позицию"),
+            BotCommand("ping", "Проверить, отвечает ли бот"),
+            BotCommand("restart", "Перезапустить бот"),
+        ])
         if self.execution.mode is ExecutionMode.LIVE:
             for chat_id in self.access.allowed_user_ids:
                 await application.bot.send_message(
@@ -172,7 +193,55 @@ class FuturesBot:
         self._reset_user_state(context.user_data)
         await update.message.reply_text(
             "👋 Привет! Отправь мне сигнал из канала.\n"
-            "Я распознаю его и помогу войти в сделку."
+            "Я распознаю его и помогу войти в сделку.\n\n"
+            "Список команд: /help"
+        )
+
+    async def help(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update):
+            return
+        await update.effective_message.reply_text(
+            "Команды бота:\n\n"
+            "/mode — текущий режим торговли\n"
+            "/positions — открытые позиции\n"
+            "/orders — активные ордера\n"
+            "/trades — последние сделки\n"
+            "/stats — статистика торговли\n"
+            "/export — скачать журнал сделок\n"
+            "/cancel_order — отменить ордер\n"
+            "/close_position — закрыть позицию\n"
+            "/ping — проверить работу бота\n"
+            "/restart — перезапустить процесс\n\n"
+            "Для новой сделки просто отправьте текст сигнала."
+        )
+
+    async def ping(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update):
+            return
+        await update.effective_message.reply_text("✅ Бот отвечает")
+
+    async def restart(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update):
+            return
+        await update.effective_message.reply_text(
+            "🔄 Перезапускаю бот..."
+        )
+        await asyncio.sleep(0.5)
+        os.execv(
+            sys.executable,
+            [sys.executable, *sys.argv],
         )
     
     async def handle_signal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -269,16 +338,46 @@ class FuturesBot:
         context.user_data[RISK_KEY] = risk
         
         msg = await update.message.reply_text("⏳ Считаю...")
-        
+        await self._calculate_and_send_proposal(
+            update.message,
+            msg,
+            context.user_data,
+            signal,
+            leverage,
+            risk,
+        )
+        return ConversationHandler.END
+
+    async def _calculate_and_send_proposal(
+        self,
+        message,
+        progress_message,
+        user_data,
+        signal,
+        leverage,
+        risk,
+    ) -> None:
         try:
             settings = TradeSettings(
                 leverage=leverage,
                 risk_percent=risk,
             )
             trade_service = TradeService(self.client, settings)
-            account = await asyncio.to_thread(
-                self.account_service.get_account,
-                "USDT",
+            account, existing_orders, existing_positions = (
+                await asyncio.gather(
+                    asyncio.to_thread(
+                        self.account_service.get_account,
+                        "USDT",
+                    ),
+                    asyncio.to_thread(
+                        self.order_service.get_pending_orders,
+                        signal.symbol,
+                    ),
+                    asyncio.to_thread(
+                        self.position_service.get_open_positions,
+                        signal.symbol,
+                    ),
+                )
             )
             plan = await asyncio.to_thread(
                 trade_service.build_plan,
@@ -286,7 +385,7 @@ class FuturesBot:
                 account,
             )
             proposal = TradeProposal.create(plan)
-            ProposalService.store(context.user_data, proposal)
+            ProposalService.store(user_data, proposal)
             order_info = plan.to_order_info()
             
             current = order_info["current_price"]
@@ -317,6 +416,13 @@ class FuturesBot:
                 f"Риск-бюджет: {risk_budget:.2f} USDT\n"
                 f"Расчётный риск: {sl_loss:.2f} USDT\n\n"
             )
+            exposure_warning = self._existing_exposure_warning(
+                signal.symbol,
+                existing_orders,
+                existing_positions,
+            )
+            if exposure_warning:
+                text += f"{exposure_warning}\n\n"
             text += f"*Тейки:*\n"
             
             for i, (tp, qty) in enumerate(zip(take_profits, tp_quantities)):
@@ -327,8 +433,8 @@ class FuturesBot:
                     profit = (planned_entry - tp) * qty
                 text += f"TP{i+1}: {tp} | {qty} ({share:.0f}%) | +{profit:.2f} USDT\n"
             
-            await msg.delete()
-            await update.message.reply_text(text, parse_mode='Markdown')
+            await progress_message.delete()
+            await message.reply_text(text, parse_mode='Markdown')
             
             keyboard = [
                 [
@@ -342,16 +448,95 @@ class FuturesBot:
                     ),
                 ]
             ]
-            await update.message.reply_text(
+            await message.reply_text(
                 "Подтвердите в течение 5 минут:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
         except TradePlanningError as error:
-            await msg.edit_text(f"❌ {error}")
+            if (
+                len(signal.take_profits) > 3
+                and "использовать только первые 3" in str(error)
+            ):
+                keyboard = [[
+                    InlineKeyboardButton(
+                        "✅ Рассчитать с 3 TP",
+                        callback_data="retry_three_tp",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Отмена",
+                        callback_data="retry_three_cancel",
+                    ),
+                ]]
+                await progress_message.edit_text(
+                    f"❌ {error}\n\n"
+                    "Пересчитать сделку по первым трём тейкам?",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            else:
+                await progress_message.edit_text(f"❌ {error}")
         except Exception as e:
-            await msg.edit_text(f"❌ Ошибка: {e}")
-        
-        return ConversationHandler.END
+            await progress_message.edit_text(f"❌ Ошибка: {e}")
+
+    @staticmethod
+    def _existing_exposure_warning(
+        symbol,
+        orders,
+        positions,
+    ) -> str:
+        order_count = len(orders)
+        position_count = len(positions)
+        if not order_count and not position_count:
+            return ""
+        details = []
+        if order_count:
+            details.append(f"активных ордеров: {order_count}")
+        if position_count:
+            details.append(f"открытых позиций: {position_count}")
+        return (
+            f"⚠️ *ВНИМАНИЕ: по {symbol} уже есть "
+            f"{'; '.join(details)}.*\n"
+            "Новый вход может объединиться с существующей позицией "
+            "и создать конфликт объёмов TP. Проверьте Bitunix "
+            "перед подтверждением."
+        )
+
+    async def retry_three_tp_handler(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update):
+            return
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "retry_three_cancel":
+            await query.edit_message_text("❌ Расчёт отменён")
+            return
+
+        signal = context.user_data.get(SIGNAL_KEY)
+        leverage = context.user_data.get(LEVERAGE_KEY)
+        risk = context.user_data.get(RISK_KEY)
+        if signal is None or leverage is None or risk is None:
+            await query.edit_message_text(
+                "❌ Сессия устарела. Отправьте сигнал заново."
+            )
+            return
+
+        three_tp_signal = replace(
+            signal,
+            take_profits=list(signal.take_profits[:3]),
+        )
+        context.user_data[SIGNAL_KEY] = three_tp_signal
+        await query.edit_message_text("⏳ Пересчитываю с 3 TP...")
+        await self._calculate_and_send_proposal(
+            query.message,
+            query.message,
+            context.user_data,
+            three_tp_signal,
+            leverage,
+            risk,
+        )
     
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._authorize(update):
@@ -820,7 +1005,9 @@ class FuturesBot:
             f"{tp_lines}\n"
             f"SL: {result['stop_loss']}\n"
             f"Статус входа: {status}\n"
-            "TP будут добавлены после исполнения входа."
+            "TP будут добавлены после исполнения входа.\n"
+            "👀 Контроль активен: бот ожидает исполнения "
+            "лимитного ордера и автоматически выставит тейки."
         )
 
 
@@ -852,6 +1039,7 @@ def main():
     )
     
     app.add_handler(CommandHandler("start", bot.start))
+    app.add_handler(CommandHandler("help", bot.help))
     app.add_handler(CommandHandler("mode", bot.mode))
     app.add_handler(CommandHandler("positions", bot.positions))
     app.add_handler(CommandHandler("orders", bot.orders))
@@ -860,6 +1048,8 @@ def main():
     app.add_handler(CommandHandler("export", bot.export_journal))
     app.add_handler(CommandHandler("cancel_order", bot.cancel_order))
     app.add_handler(CommandHandler("close_position", bot.close_position))
+    app.add_handler(CommandHandler("ping", bot.ping))
+    app.add_handler(CommandHandler("restart", bot.restart))
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(
         bot.management_button_handler,
@@ -868,6 +1058,10 @@ def main():
     app.add_handler(CallbackQueryHandler(
         bot.break_even_button_handler,
         pattern=r"^breakeven:",
+    ))
+    app.add_handler(CallbackQueryHandler(
+        bot.retry_three_tp_handler,
+        pattern=r"^retry_three_(tp|cancel)$",
     ))
     app.add_handler(CallbackQueryHandler(
         bot.button_handler,

@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 from models.signal import OrderSide
 from models.trade import PlannedTakeProfit, TradePlan
@@ -43,6 +44,20 @@ def test_limit_order_result_is_explicitly_formatted():
     assert "SL: 0.014" in message
     assert "Статус входа: ожидает исполнения" in message
     assert "TP будут добавлены после исполнения" in message
+    assert "Контроль активен" in message
+
+
+def test_existing_symbol_exposure_warning():
+    warning = FuturesBot._existing_exposure_warning(
+        "BNBUSDT",
+        (SimpleNamespace(), SimpleNamespace()),
+        (SimpleNamespace(),),
+    )
+
+    assert "по BNBUSDT уже есть" in warning
+    assert "активных ордеров: 2" in warning
+    assert "открытых позиций: 1" in warning
+    assert "конфликт объёмов TP" in warning
 
 
 class FakeMessage:

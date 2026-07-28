@@ -331,6 +331,32 @@ def test_five_take_profits_use_configured_distribution():
     ) == plan.total_quantity
 
 
+def test_suggests_three_targets_when_later_tp_is_below_minimum():
+    instrument = TradingPair(
+        symbol="BTCUSDT",
+        min_trade_volume="0.25",
+        max_market_order_volume="50000",
+        base_precision=2,
+        quote_precision=2,
+        min_leverage=1,
+        max_leverage=125,
+        symbol_status="OPEN",
+        api_supported=True,
+    )
+
+    with pytest.raises(
+        TradePlanningError,
+        match="использовать только первые 3 тейк-профита",
+    ):
+        make_planner(
+            max_tp_count=5,
+            instrument=instrument,
+        ).create_plan(
+            make_signal(take_profits=[55, 60, 65, 70, 75]),
+            AccountBalance("USDT", "1000"),
+        )
+
+
 @pytest.mark.parametrize(
     ("available", "leverage", "risk_percent", "message"),
     [
