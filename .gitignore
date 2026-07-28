@@ -2,8 +2,10 @@
 *.env
 
 venv/
+.venv/
 env/
 ENV/
+build/
 
 __pycache__/
 .pytest_cache/
