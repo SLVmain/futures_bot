@@ -1,97 +1,461 @@
 # Futures Bot
 
-Telegram-assisted Bitunix futures bot. The default execution mode is
-`dry-run`; write requests are simulated and private WebSocket monitoring is
-disabled.
+Telegram-бот для подготовки и подтверждения сделок на фьючерсах
+Bitunix. Бот распознаёт торговый сигнал, рассчитывает объём позиции по
+заданному риску, показывает расчёт и только после подтверждения отправляет
+пакет ордеров.
 
-## Setup
+По умолчанию используется безопасный режим `dry-run`: торговые запросы
+симулируются и реальные ордера не создаются.
 
-Use Python 3.12 and install the project dependencies:
+> Бот работает с финансовыми рисками. Сначала проверьте установку и формат
+> сигналов в `dry-run`. Для API-ключа отключите вывод средств и выдайте только
+> минимально необходимые разрешения на чтение и фьючерсную торговлю.
+
+## Возможности
+
+- распознавание LONG/SHORT-сигналов из текста Telegram;
+- расчёт объёма по балансу, стоп-лоссу и выбранному проценту риска;
+- рыночный вход, если цена находится в диапазоне сигнала;
+- лимитный вход по середине диапазона, если цена вне диапазона;
+- три или пять частичных входов с отдельными TP и общим SL;
+- подтверждение сделки кнопкой до отправки ордеров;
+- просмотр позиций, ордеров, сделок и статистики в Telegram;
+- подтверждаемая отмена ордера и закрытие позиции;
+- приватный WebSocket-мониторинг Bitunix;
+- журнал сделок в CSV;
+- предложение перенести SL в безубыток после исполнения TP1.
+
+## Требования
+
+- Linux;
+- Python 3.12 или новее;
+- Git;
+- Telegram-бот, созданный через официальный BotFather;
+- аккаунт Bitunix и API-доступ для чтения баланса и рыночных данных;
+- стабильное подключение к интернету.
+
+Для постоянной работы лучше использовать VPS или отдельный постоянно
+включённый компьютер. Ноутбук подходит, если сон при закрытии крышки
+заблокирован на время работы бота.
+
+## Установка
+
+### 1. Скачать проект
+
+```bash
+git clone https://github.com/SLVmain/futures_bot.git
+cd futures_bot
+```
+
+Если нужна конкретная ветка:
+
+```bash
+git switch refactor/bitunix-safety
+```
+
+### 2. Создать виртуальное окружение
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+```
+
+После активации в начале строки терминала появится `(.venv)`.
+
+### 3. Установить зависимости
+
+Для запуска бота:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+Для разработки и запуска тестов:
 
 ```bash
 python -m pip install -e ".[test]"
 ```
 
-Copy `.env.example` to `.env` and fill values locally. Never commit `.env`,
-API keys, Telegram tokens, generated CSV journals, or proxy credentials.
+## Безопасная настройка
 
-## Modes
+Настройки хранятся только в локальном файле `.env` в корне проекта.
+Не добавляйте `.env` в Git и не отправляйте его содержимое в сообщения,
+скриншоты, README или журналы ошибок.
 
-- `dry-run` is the safe default.
-- `testnet` requires separate REST and WebSocket testnet URLs.
-- `live` is enabled by `TRADING_MODE=live` and requires a non-empty
-  `TELEGRAM_ALLOWED_USER_IDS` plus private WebSocket monitoring.
+Создайте файл локально:
 
-Private monitoring additionally requires:
+```bash
+touch .env
+chmod 600 .env
+```
 
-```env
+Заполните его самостоятельно по следующему шаблону. Значения в угловых
+скобках — не готовые данные, а обозначения того, что нужно подставить:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=<telegram_bot_token>
+TELEGRAM_ALLOWED_USER_IDS=<telegram_numeric_user_id>
+
+BITUNIX_API_KEY=<bitunix_api_key>
+BITUNIX_API_SECRET=<bitunix_api_secret>
+
+TRADING_MODE=dry-run
+ENABLE_PRIVATE_WEBSOCKET=false
+
+TRADE_JOURNAL_PATH=data/trade_journal.csv
+FUTURES_TAKER_FEE_RATE=0.0006
+```
+
+Не копируйте этот блок с незаменёнными значениями для рабочего запуска.
+
+### Назначение переменных
+
+| Переменная | Назначение |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Токен Telegram-бота |
+| `TELEGRAM_ALLOWED_USER_IDS` | Разрешённые числовые Telegram ID через запятую |
+| `BITUNIX_API_KEY` | API-ключ Bitunix |
+| `BITUNIX_API_SECRET` | Секрет API-ключа Bitunix |
+| `TRADING_MODE` | Режим: `dry-run`, `testnet` или `live` |
+| `ENABLE_PRIVATE_WEBSOCKET` | Приватный мониторинг: `true` или `false` |
+| `TRADE_JOURNAL_PATH` | Путь к локальному CSV-журналу |
+| `FUTURES_TAKER_FEE_RATE` | Комиссия taker в десятичном виде |
+| `TELEGRAM_PROXY` | Необязательный URL прокси для Telegram |
+
+Для `testnet` дополнительно требуются адреса тестовой среды:
+
+```dotenv
+BITUNIX_TESTNET_BASE_URL=<testnet_https_url>
+BITUNIX_TESTNET_WEBSOCKET_URL=<testnet_websocket_url>
+```
+
+Не подставляйте производственные адреса Bitunix в настройки `testnet`.
+
+### Как узнать Telegram ID
+
+Отправьте сообщение специальному боту для определения своего числового
+Telegram ID или получите ID через Telegram API. В `.env` указываются только
+числа:
+
+```dotenv
+TELEGRAM_ALLOWED_USER_IDS=<first_user_id>,<second_user_id>
+```
+
+Если появляется сообщение `Доступ запрещён`, проверьте, что ID пользователя
+внесён в список без пробелов, лишних символов и имени пользователя.
+
+## Режимы работы
+
+### `dry-run`
+
+```dotenv
+TRADING_MODE=dry-run
+ENABLE_PRIVATE_WEBSOCKET=false
+```
+
+Безопасный режим по умолчанию. Бот читает баланс и рыночные данные для
+расчёта, но имитирует изменяющие запросы и не создаёт реальные ордера.
+Поэтому действующий API-доступ для чтения нужен и в `dry-run`. Начинайте
+проверку именно с этого режима.
+
+### `testnet`
+
+```dotenv
+TRADING_MODE=testnet
 ENABLE_PRIVATE_WEBSOCKET=true
 ```
 
-It is forcibly disabled in `dry-run` and required in `live`, because partial
-TP orders are installed only after the entry fill is confirmed. Do not enable
-live mode until the API key has read/trade permissions only and withdrawals
-are disabled.
+Использует отдельные REST- и WebSocket-адреса тестовой среды. Для testnet
+нужны отдельные тестовые ключи и URL.
 
-## Trading flow
+### `live`
 
-- A signal is parsed in Telegram.
-- Risk-based quantity is calculated from the planned entry and stop loss.
-- The entry order uses the full quantity and includes the common SL.
-- After the entry is confirmed filled, partial TP orders are added. Three
-  targets use 50/30/20; five use 40/25/15/10/10.
-- After TP1 is confirmed filled by WebSocket, Telegram shows the current
-  position details and asks for confirmation. Only after confirmation is the
-  remaining SL moved to fee-aware break-even based on the actual average
-  entry, deducted fees, paid funding, estimated closing taker fee, and one
-  price tick of buffer.
-- Price inside the entry range creates a market order.
-- Price outside the range creates a limit order at the range midpoint.
-- Every state-changing command requires a one-time confirmation.
+```dotenv
+TRADING_MODE=live
+ENABLE_PRIVATE_WEBSOCKET=true
+```
 
-## Monitoring and journal
+В этом режиме подтверждённые сделки создают реальные ордера. Для запуска
+обязательны:
 
-When explicitly enabled, the bot logs in to the Bitunix private WebSocket and
-subscribes to `order`, `position`, `balance`, and `tpsl` in one request. It
-uses ping heartbeats and exponential reconnect delays.
+- заполненный `TELEGRAM_ALLOWED_USER_IDS`;
+- `ENABLE_PRIVATE_WEBSOCKET=true`;
+- API-ключ с разрешением на фьючерсную торговлю;
+- отключённое разрешение на вывод средств;
+- заранее проверенный `dry-run`.
 
-After every connection it reconciles pending REST orders, open positions, and
-pending TP/SL orders. Telegram warnings are sent for positions missing TP or
-SL. Order fills, cancellations, position open/close events, and TP/SL events
-are appended to `data/trade_journal.csv` and sent to allowed Telegram users.
+Сообщение
+`ENABLE_PRIVATE_WEBSOCKET=true is required in live mode` означает, что бот
+видит live-режим, но приватный мониторинг не включён. Проверьте, что строка
+записана именно в `.env` проекта, без кавычек и опечаток, после чего полностью
+перезапустите процесс.
 
-The CSV journal is append-only, uses an OS file lock, and deduplicates
-WebSocket events by source event ID. Bitunix remains the source of truth.
+## Первый запуск
 
-### Journal analysis
+Активируйте окружение и запустите Telegram-бот:
 
-Install the optional analysis tools:
+```bash
+cd /path/to/futures_bot
+source .venv/bin/activate
+python telegram_bot.py
+```
+
+В терминале должно появиться:
+
+```text
+Бот запущен...
+Режим исполнения: dry-run
+```
+
+Откройте Telegram и отправьте:
+
+```text
+/start
+/ping
+/mode
+```
+
+Остановить ручной запуск можно сочетанием `Ctrl+C`.
+
+Не запускайте одновременно две копии бота: Telegram-обновления, уведомления и
+мониторинг могут дублироваться.
+
+## Как пользоваться ботом
+
+### Создание сделки
+
+1. Перешлите или вставьте текст сигнала в чат с ботом.
+2. Проверьте распознанные символ, направление, вход, TP и SL.
+3. Введите плечо.
+4. Введите риск в процентах.
+5. Проверьте расчёт: цену входа, общий объём, риск в USDT и распределение TP.
+6. Нажмите кнопку подтверждения только после полной проверки.
+
+Если рассчитанный объём не позволяет разместить четыре или пять TP из-за
+минимального объёма Bitunix, бот предложит пересчитать сделку на три тейка.
+Новый вариант также требует отдельного подтверждения.
+
+### Что отправляется на Bitunix
+
+Бот разбивает общий объём на частичные входы:
+
+- три TP: `50% / 30% / 20%`;
+- пять TP: `40% / 25% / 15% / 10% / 10%`.
+
+Каждый частичный вход отправляется со своим TP и общим SL. Защита хранится на
+стороне Bitunix и после успешного принятия ордеров не зависит от того, работает
+ли Telegram-бот.
+
+Для лимитного сигнала пакет входных ордеров будет виден до исполнения. После
+исполнения Bitunix создаёт соответствующие частичные позиции, а монитор
+проверяет, что к каждой части прикреплены правильные TP и SL.
+
+Если бот перезапустился, он загружает незавершённые планы из локального
+CSV-журнала и сверяет ордера, позиции и защиту с Bitunix.
+
+### После TP1
+
+Когда WebSocket подтверждает исполнение TP1, бот показывает текущие данные
+позиции и предлагает перенести SL в безубыток с учётом комиссии. Изменение SL
+выполняется только после нажатия кнопки подтверждения.
+
+## Команды Telegram
+
+| Команда | Что делает |
+|---|---|
+| `/start` | Начинает новый диалог и очищает незавершённый ввод |
+| `/help` | Показывает список команд |
+| `/mode` | Показывает текущий режим `dry-run`, `testnet` или `live` |
+| `/ping` | Проверяет, отвечает ли процесс бота |
+| `/positions` | Показывает открытые позиции |
+| `/orders` | Показывает активные ордера |
+| `/trades` | Показывает последние завершённые сделки |
+| `/stats` | Показывает статистику и чистый PnL из журнала |
+| `/export` | Отправляет CSV-журнал в Telegram |
+| `/cancel_order` | Предлагает выбрать активный ордер для отмены |
+| `/cancel_order SYMBOL ORDER_ID` | Находит конкретный ордер и просит подтверждение |
+| `/close_position` | Предлагает выбрать позицию для закрытия |
+| `/close_position POSITION_ID` | Находит конкретную позицию и просит подтверждение |
+| `/restart` | Перезапускает текущий процесс бота |
+
+Отмена и закрытие не выполняются сразу: бот повторно проверяет объект и
+показывает кнопку подтверждения.
+
+## Постоянный запуск через systemd
+
+В проекте есть шаблон [deploy/futures-bot.service](deploy/futures-bot.service).
+Перед установкой откройте его и замените пути в `WorkingDirectory` и
+`ExecStart` на фактический абсолютный путь к проекту и `.venv`.
+
+Установите службу текущего пользователя:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/futures-bot.service ~/.config/systemd/user/futures-bot.service
+systemctl --user daemon-reload
+systemctl --user enable --now futures-bot
+```
+
+Проверка:
+
+```bash
+systemctl --user status futures-bot
+journalctl --user -u futures-bot -n 100 --no-pager
+```
+
+Перезапуск и остановка:
+
+```bash
+systemctl --user restart futures-bot
+systemctl --user stop futures-bot
+```
+
+Не запускайте `python telegram_bot.py`, пока служба активна.
+
+Подробная инструкция для ноутбука находится в
+[docs/LAPTOP_RUNBOOK.md](docs/LAPTOP_RUNBOOK.md).
+
+## Обновление
+
+Сначала остановите работающего бота:
+
+```bash
+systemctl --user stop futures-bot
+```
+
+Затем обновите текущую ветку без автоматического merge-коммита:
+
+```bash
+git status
+git pull --ff-only
+```
+
+Если `git status` показывает локальные изменения, сначала сохраните их
+отдельным коммитом или разберите вручную. Не удаляйте `.env` и локальный
+CSV-журнал.
+
+После обновления:
+
+```bash
+source .venv/bin/activate
+python -m pip install -e .
+systemctl --user start futures-bot
+systemctl --user status futures-bot
+```
+
+В Telegram проверьте:
+
+```text
+/ping
+/mode
+```
+
+## Журнал сделок
+
+По умолчанию журнал хранится в:
+
+```text
+data/trade_journal.csv
+```
+
+В него записываются исполнения входов, отмены, события позиций, TP/SL,
+комиссии, funding и итоговые результаты. Журнал работает только как локальная
+история; источником фактического состояния ордеров и позиций остаётся Bitunix.
+
+Для анализа установите дополнительные зависимости:
 
 ```bash
 python -m pip install -e ".[analysis]"
 ```
 
-Open `notebooks/trade_journal_analysis.ipynb` directly in VS Code and select
-the project `venv` as the notebook kernel. It reads the local CSV without
-contacting Bitunix and shows completed trades, TP/SL executions, net PnL,
-fees, funding, win rate, daily and symbol aggregations, charts, and
-data-quality checks. JupyterLab is not required.
+Затем откройте
+`notebooks/trade_journal_analysis.ipynb` в VS Code и выберите `.venv` как
+Python kernel. Ноутбук читает локальный CSV и не обращается к Bitunix.
 
-## Telegram commands
+## Типовые проблемы
 
-- `/mode`
-- `/positions`
-- `/orders`
-- `/trades`
-- `/stats`
-- `/export`
-- `/cancel_order SYMBOL ORDER_ID`
-- `/close_position POSITION_ID`
-
-## Tests
-
-Tests use fakes and do not connect to Bitunix:
+### Бот не отвечает
 
 ```bash
+systemctl --user status futures-bot
+journalctl --user -u futures-bot -n 100 --no-pager
+systemctl --user restart futures-bot
+```
+
+После перезапуска отправьте `/ping`. Не запускайте вторую копию процесса.
+
+### `Доступ запрещён`
+
+Текущий числовой Telegram ID отсутствует в
+`TELEGRAM_ALLOWED_USER_IDS`. Исправьте локальный `.env` и перезапустите бота.
+
+### `Chat not found`
+
+Убедитесь, что пользователь сначала открыл чат с ботом и нажал Start, а
+разрешённый Telegram ID указан правильно.
+
+### WebSocket отключается
+
+Кратковременное переподключение допустимо. Бот использует повторные попытки и
+после соединения сверяет состояние через REST. Если отключения постоянные:
+
+1. проверьте интернет и системное время;
+2. проверьте разрешения и актуальность API-ключа;
+3. убедитесь, что включена фьючерсная торговля;
+4. посмотрите последние сообщения службы;
+5. проверьте, что запущен только один экземпляр.
+
+Не публикуйте полный журнал, если в нём могут находиться приватные данные.
+
+### Инструмент не поддерживает API-торговлю
+
+В сигнале должен быть биржевой символ, например `ETHUSDT`, без суффиксов
+TradingView `.P`. Бот очищает распространённый суффикс, но перед
+подтверждением всегда проверяйте распознанный символ.
+
+### TP или SL не видны
+
+Сначала проверьте фактические ордера и позиции непосредственно в Bitunix.
+Лимитный вход может ещё ожидать исполнения. Для пакетного входа Bitunix может
+показывать несколько частичных позиций и отдельную защиту для каждой.
+
+Предупреждение мониторинга не означает, что бот автоматически создаст
+дополнительный TP: при конфликте он ничего не меняет и просит проверить
+Bitunix вручную.
+
+## Ручное управление в Bitunix
+
+TP и SL можно поставить вручную через интерфейс биржи. Перед изменением
+проверьте:
+
+- направление и фактический остаток каждой позиции;
+- суммарный объём всех закрывающих ордеров;
+- отсутствие дублирующих TP;
+- правильность trigger price и типа цены;
+- наличие SL для каждой частичной позиции.
+
+Если ручные TP отличаются от сохранённого плана, монитор сообщит о конфликте
+и не будет автоматически исправлять ордера.
+
+## Тесты
+
+Тесты используют заглушки и не подключаются к Bitunix:
+
+```bash
+source .venv/bin/activate
 python -m pytest
 ```
+
+## Правила безопасности
+
+- Никогда не публикуйте `.env`.
+- Никогда не добавляйте ключи, токены и пароли в Git.
+- Не выдавайте API-ключу разрешение на вывод средств.
+- Используйте отдельные ключи для testnet и live.
+- Ограничьте доступ к боту через `TELEGRAM_ALLOWED_USER_IDS`.
+- Проверяйте режим командой `/mode` перед подтверждением сделки.
+- Всегда сверяйте символ, сторону, объём, плечо, TP и SL.
+- Не запускайте две копии бота одновременно.
+- Bitunix остаётся главным источником фактического состояния сделки.
