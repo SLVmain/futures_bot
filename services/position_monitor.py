@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 import time
 from uuid import uuid4
@@ -51,6 +51,10 @@ class PositionMonitor:
         self.taker_fee_rate = taker_fee_rate
         self.position_retry_delays = position_retry_delays
         self._plans_by_client_id = journal.load_pending_plans()
+        self._tp_numbers_by_client_id = {
+            client_id: self._tp_number_from_client_id(client_id)
+            for client_id in self._plans_by_client_id
+        }
         self._tp_orders = journal.load_active_tp_orders()
         self._tp1_order_positions = {
             order_id: position_id
@@ -67,13 +71,23 @@ class PositionMonitor:
         plan,
         *,
         persist: bool = True,
+        tp_number: int | None = None,
     ) -> None:
+        if tp_number is not None:
+            take_profit = plan.take_profits[tp_number - 1]
+            plan = replace(
+                plan,
+                total_quantity=take_profit.quantity,
+                take_profits=(take_profit,),
+            )
+            self._tp_numbers_by_client_id[client_id] = tp_number
         self._plans_by_client_id[client_id] = plan
         if persist:
             self.journal.save_plan(client_id, plan)
 
     def discard_plan(self, client_id: str) -> None:
         self._plans_by_client_id.pop(client_id, None)
+        self._tp_numbers_by_client_id.pop(client_id, None)
         self.journal.finish_plan(client_id, "FAILED")
 
     async def handle_event(self, message: dict) -> None:
@@ -179,16 +193,14 @@ class PositionMonitor:
         if channel == "order" and status == "FILLED":
             await self._verify_attached_protections(data)
         if channel == "position" and data.get("event") == "OPEN":
-            checked_execution_ids = set()
-            for plan in tuple(
-                self._plans_by_client_id.values()
+            for client_id, plan in tuple(
+                self._plans_by_client_id.items()
             ):
-                if (
-                    plan.symbol == data.get("symbol")
-                    and plan.execution_id not in checked_execution_ids
-                ):
-                    checked_execution_ids.add(plan.execution_id)
-                    await self._verify_plan_protections(plan)
+                if plan.symbol == data.get("symbol"):
+                    await self._verify_plan_protections(
+                        plan,
+                        client_id,
+                    )
         if channel == "tpsl" and status == "FILLED":
             await self._request_break_even(data)
 
@@ -197,9 +209,13 @@ class PositionMonitor:
         plan = self._plans_by_client_id.get(client_id)
         if plan is None:
             return
-        await self._verify_plan_protections(plan)
+        await self._verify_plan_protections(plan, client_id)
 
-    async def _verify_plan_protections(self, plan) -> None:
+    async def _verify_plan_protections(
+        self,
+        plan,
+        client_id: str | None = None,
+    ) -> None:
         position = await self._wait_for_position(plan)
         if position is None:
             await self.notifier(
@@ -252,18 +268,23 @@ class PositionMonitor:
         recovered = 0
         failed = False
         used_existing_ids = set()
-        client_id = next(
-            (
-                key
-                for key, candidate
-                in self._plans_by_client_id.items()
-                if candidate.execution_id == plan.execution_id
-            ),
-            "",
+        if client_id is None:
+            client_id = next(
+                (
+                    key
+                    for key, candidate
+                    in self._plans_by_client_id.items()
+                    if candidate is plan
+                ),
+                "",
+            )
+        first_tp_number = self._tp_numbers_by_client_id.get(
+            client_id,
+            1,
         )
         for index, take_profit in enumerate(
             plan.take_profits,
-            start=1,
+            start=first_tp_number,
         ):
             price = Decimal(str(take_profit.price))
             quantity = Decimal(str(take_profit.quantity))
@@ -351,20 +372,25 @@ class PositionMonitor:
         if recovered:
             await self.notifier(
                 f"✅ Проверены прикреплённые TP: {recovered}; "
-                "контроль TP1 активен"
+                f"контроль TP{first_tp_number} активен"
             )
         if not failed:
-            client_ids = [
-                client_id
-                for client_id, candidate in self._plans_by_client_id.items()
-                if candidate.execution_id == plan.execution_id
-            ]
-            for client_id in client_ids:
+            if client_id:
                 self.journal.finish_plan(client_id, "CONFIGURED")
                 self._plans_by_client_id.pop(client_id, None)
+                self._tp_numbers_by_client_id.pop(client_id, None)
+
+    @staticmethod
+    def _tp_number_from_client_id(client_id: str) -> int:
+        try:
+            number = int(client_id.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            return 1
+        return number if number > 0 else 1
 
     async def _wait_for_position(self, plan):
         delays = (0, *self.position_retry_delays)
+        fallback = None
         for attempt, delay in enumerate(delays):
             if delay:
                 await asyncio.sleep(delay)
@@ -377,11 +403,72 @@ class PositionMonitor:
                 for position in positions
                 if position.side == plan.side.value
             )
-            if matching:
+            expected_quantity = Decimal(str(plan.total_quantity))
+            quantity_matches = tuple(
+                position
+                for position in matching
+                if abs(
+                    Decimal(str(position.quantity))
+                    - expected_quantity
+                ) <= self.QUANTITY_TOLERANCE
+            )
+            if len(quantity_matches) == 1:
+                return quantity_matches[0]
+            if quantity_matches:
+                fallback = quantity_matches[0]
+                expected_take_profits = {
+                    (
+                        Decimal(str(take_profit.price)),
+                        Decimal(str(take_profit.quantity)),
+                    )
+                    for take_profit in plan.take_profits
+                }
+                for position in quantity_matches:
+                    protections = await asyncio.to_thread(
+                        self.protections.get_pending_tp_sl,
+                        plan.symbol,
+                        position.position_id,
+                    )
+                    if any(
+                        self._protection_matches(
+                            item,
+                            position.position_id,
+                            expected_take_profits,
+                        )
+                        for item in protections
+                    ):
+                        return position
+            elif matching and len(plan.take_profits) > 1:
+                # Compatibility with plans saved by older versions,
+                # where all partial entries shared one aggregate plan.
                 return matching[0]
             if attempt < len(delays) - 1:
                 continue
-        return None
+        return fallback
+
+    def _protection_matches(
+        self,
+        item: dict,
+        position_id: str,
+        expected_take_profits: set[tuple[Decimal, Decimal]],
+    ) -> bool:
+        if (
+            str(item.get("positionId", "")) != position_id
+            or not item.get("tpPrice")
+        ):
+            return False
+        try:
+            price = Decimal(str(item.get("tpPrice")))
+            quantity = Decimal(str(item.get("tpQty")))
+        except (InvalidOperation, TypeError):
+            return False
+        return any(
+            price == expected_price
+            and abs(quantity - expected_quantity)
+            <= self.QUANTITY_TOLERANCE
+            for expected_price, expected_quantity
+            in expected_take_profits
+        )
 
     async def _request_break_even(self, data: dict) -> None:
         order_id = str(data.get("orderId", ""))
@@ -571,20 +658,19 @@ class PositionMonitor:
                 f"ID {position.position_id}. "
                 f"Отсутствует: {', '.join(missing)}"
             )
-        checked_execution_ids = set()
         for client_id, plan in tuple(
             self._plans_by_client_id.items()
         ):
-            if plan.execution_id in checked_execution_ids:
-                continue
-            checked_execution_ids.add(plan.execution_id)
             position_visible = any(
                 position.symbol == plan.symbol
                 and position.side == plan.side.value
                 for position in positions
             )
             if position_visible:
-                await self._verify_plan_protections(plan)
+                await self._verify_plan_protections(
+                    plan,
+                    client_id,
+                )
             pending_order = next(
                 (
                     order

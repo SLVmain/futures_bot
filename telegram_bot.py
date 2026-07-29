@@ -607,17 +607,18 @@ class FuturesBot:
                 client_ids = self.execution_service.client_ids(
                     proposal.plan
                 )
-                accepted_client_ids = [
-                    client_ids[order.tp_number - 1]
+                accepted_orders = [
+                    (
+                        client_ids[order.tp_number - 1],
+                        order.tp_number,
+                    )
                     for order in execution_result.orders
                 ]
-                for index, client_id in enumerate(
-                    accepted_client_ids
-                ):
+                for client_id, tp_number in accepted_orders:
                     self.monitor.register_plan(
                         client_id,
                         proposal.plan,
-                        persist=index == 0,
+                        tp_number=tp_number,
                     )
             await asyncio.to_thread(
                 self.journal.append,

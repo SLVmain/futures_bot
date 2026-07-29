@@ -479,6 +479,96 @@ def test_filled_entry_retries_until_position_is_visible(tmp_path):
     asyncio.run(scenario())
 
 
+def test_partial_entries_are_matched_to_their_own_positions(
+    tmp_path,
+    monkeypatch,
+):
+    async def run_synchronously(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(
+        asyncio,
+        "to_thread",
+        run_synchronously,
+    )
+
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        monitor.position_retry_delays = ()
+        plan = TradePlan(
+            symbol="BTCUSDT",
+            side=OrderSide.LONG,
+            entry_min=49,
+            entry_max=51,
+            current_price=50,
+            in_range=True,
+            total_quantity=3,
+            stop_loss=45,
+            take_profits=(
+                PlannedTakeProfit(55, 1),
+                PlannedTakeProfit(60, 1),
+                PlannedTakeProfit(65, 1),
+            ),
+            leverage=10,
+            risk_percent=1,
+            risk_budget=10,
+        )
+        positions = (
+            replace(
+                make_position(),
+                position_id="position-2",
+                quantity="1",
+            ),
+            replace(
+                make_position(),
+                position_id="position-3",
+                quantity="1",
+            ),
+        )
+        monitor.positions.get_open_positions = lambda *args: positions
+        monitor.protections.pending = [
+            {
+                "id": "tp-2",
+                "positionId": "position-2",
+                "tpPrice": "60",
+                "tpQty": "1",
+            },
+            {
+                "id": "tp-3",
+                "positionId": "position-3",
+                "tpPrice": "65",
+                "tpQty": "1",
+            },
+        ]
+        monitor.register_plan(
+            "bot-execution-2",
+            plan,
+            tp_number=2,
+        )
+        monitor.register_plan(
+            "bot-execution-3",
+            plan,
+            tp_number=3,
+        )
+
+        await monitor._verify_plan_protections(
+            monitor._plans_by_client_id["bot-execution-3"],
+            "bot-execution-3",
+        )
+
+        assert "bot-execution-2" in monitor._plans_by_client_id
+        assert "bot-execution-3" not in monitor._plans_by_client_id
+        assert monitor._tp_orders["tp-3"] == ("position-3", 3)
+        assert "tp-3" not in monitor._tp1_order_positions
+        assert notifications[-1] == (
+            "✅ Проверены прикреплённые TP: 1; "
+            "контроль TP3 активен"
+        )
+
+    asyncio.run(scenario())
+
+
 def test_filled_entry_warns_after_position_retries(tmp_path):
     async def scenario():
         notifications = []
