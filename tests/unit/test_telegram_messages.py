@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from telegram.error import NetworkError
 
-from models.signal import OrderSide
+from models.signal import OrderSide, TradeSignal
 from models.trade import PlannedTakeProfit, TradePlan
 from services.trade_journal import CsvTradeJournal, JournalEvent
 from telegram_bot import FuturesBot, telegram_error_handler
@@ -62,6 +62,21 @@ def test_existing_symbol_exposure_warning():
     assert "активных ордеров: 2" in warning
     assert "открытых позиций: 1" in warning
     assert "конфликт объёмов TP" in warning
+
+
+def test_signal_entry_range_is_formatted_in_ascending_order():
+    signal = TradeSignal(
+        symbol="ETHUSDT",
+        side=OrderSide.LONG,
+        entry_min=3200.5,
+        entry_max=3180.25,
+        take_profits=[3250],
+        stop_loss=3150,
+    )
+
+    entry_range = FuturesBot._format_entry_range(signal)
+
+    assert entry_range == "3180.25–3200.5"
 
 
 class FakeMessage:

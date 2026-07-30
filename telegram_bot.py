@@ -317,10 +317,80 @@ class FuturesBot:
             f"Вход: {min(signal.entry_min, signal.entry_max)} - {max(signal.entry_min, signal.entry_max)}\n\n"
             f"{tp_lines}\n\n"
             f"SL: {signal.stop_loss}\n\n"
-            f"Введите плечо (например, 10):"
+            "Выберите плечо:",
+            reply_markup=self._leverage_keyboard(),
         )
         return WAITING_LEVERAGE
-    
+
+    @staticmethod
+    def _leverage_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "10x",
+                    callback_data="leverage:10",
+                ),
+                InlineKeyboardButton(
+                    "15x",
+                    callback_data="leverage:15",
+                ),
+                InlineKeyboardButton(
+                    "20x",
+                    callback_data="leverage:20",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✍️ Ввести вручную",
+                    callback_data="leverage:manual",
+                ),
+            ],
+        ])
+
+    @staticmethod
+    def _risk_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "1%",
+                callback_data="risk:1",
+            ),
+            InlineKeyboardButton(
+                "2%",
+                callback_data="risk:2",
+            ),
+            InlineKeyboardButton(
+                "3%",
+                callback_data="risk:3",
+            ),
+        ]])
+
+    async def leverage_button_handler(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        if not await self._authorize(update):
+            return ConversationHandler.END
+        query = update.callback_query
+        await query.answer()
+        value = query.data.split(":", 1)[1]
+        if value == "manual":
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text(
+                "Введите плечо числом от 1 до 125:"
+            )
+            return WAITING_LEVERAGE
+
+        leverage = int(value)
+        context.user_data[LEVERAGE_KEY] = leverage
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"✅ Плечо: {leverage}x\n"
+            "Выберите риск:",
+            reply_markup=self._risk_keyboard(),
+        )
+        return WAITING_RISK
+
     async def set_leverage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._authorize(update):
             return ConversationHandler.END
@@ -337,36 +407,51 @@ class FuturesBot:
         
         await update.message.reply_text(
             f"✅ Плечо: {leverage}x\n"
-            "Введите процент риска (например, 1):"
+            "Выберите риск:",
+            reply_markup=self._risk_keyboard(),
         )
         return WAITING_RISK
-    
-    async def set_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    async def risk_button_handler(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
         if not await self._authorize(update):
             return ConversationHandler.END
-        try:
-            risk = float(update.message.text)
-            if risk <= 0 or risk > 100:
-                await update.message.reply_text("⚠️ Риск от 0.1 до 100:")
-                return WAITING_RISK
-        except ValueError:
-            await update.message.reply_text("⚠️ Введите число:")
-            return WAITING_RISK
+        query = update.callback_query
+        await query.answer()
+        risk = float(query.data.split(":", 1)[1])
+        await query.edit_message_reply_markup(reply_markup=None)
+        progress_message = await query.message.reply_text(
+            "⏳ Считаю..."
+        )
+        return await self._calculate_selected_risk(
+            query.message,
+            progress_message,
+            context,
+            risk,
+        )
 
+    async def _calculate_selected_risk(
+        self,
+        message,
+        progress_message,
+        context,
+        risk,
+    ):
         signal = context.user_data.get(SIGNAL_KEY)
         leverage = context.user_data.get(LEVERAGE_KEY)
         if signal is None or leverage is None:
-            await update.message.reply_text(
+            await progress_message.edit_text(
                 "❌ Сессия устарела. Отправьте сигнал заново."
             )
             return ConversationHandler.END
 
         context.user_data[RISK_KEY] = risk
-        
-        msg = await update.message.reply_text("⏳ Считаю...")
         await self._calculate_and_send_proposal(
-            update.message,
-            msg,
+            message,
+            progress_message,
             context.user_data,
             signal,
             leverage,
@@ -433,6 +518,10 @@ class FuturesBot:
             text += f"*{signal.side.value} {order_info['symbol']}*\n"
             text += f"Плечо: {leverage}x | Риск: {risk}%\n"
             text += f"Текущая цена Bitunix: {current}\n"
+            text += (
+                "Диапазон сигнала: "
+                f"{self._format_entry_range(signal)}\n"
+            )
             text += f"Тип ордера: {order_info['order_type']}\n"
             text += f"Плановая цена входа: {planned_entry}\n"
             text += f"Объём: {total_qty}\n"
@@ -502,6 +591,13 @@ class FuturesBot:
                 await progress_message.edit_text(f"❌ {error}")
         except Exception as e:
             await progress_message.edit_text(f"❌ Ошибка: {e}")
+
+    @staticmethod
+    def _format_entry_range(signal) -> str:
+        return (
+            f"{min(signal.entry_min, signal.entry_max)}"
+            f"–{max(signal.entry_min, signal.entry_max)}"
+        )
 
     @staticmethod
     def _existing_exposure_warning(
@@ -1313,8 +1409,22 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler((filters.TEXT | filters.PHOTO | filters.CAPTION) & ~filters.COMMAND, bot.handle_signal)],
         states={
-            WAITING_LEVERAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.set_leverage)],
-            WAITING_RISK: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.set_risk)],
+            WAITING_LEVERAGE: [
+                CallbackQueryHandler(
+                    bot.leverage_button_handler,
+                    pattern=r"^leverage:(10|15|20|manual)$",
+                ),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    bot.set_leverage,
+                ),
+            ],
+            WAITING_RISK: [
+                CallbackQueryHandler(
+                    bot.risk_button_handler,
+                    pattern=r"^risk:(1|2|3)$",
+                ),
+            ],
         },
         fallbacks=[CommandHandler("start", bot.start)],
     )
