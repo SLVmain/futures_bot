@@ -41,6 +41,7 @@ from services.proposal_service import (
 )
 from config.access import TelegramAccessConfig
 from config.monitoring import MonitoringConfig
+from config.triggers import TriggerConfig
 from models.management import ManagementAction, ManagementProposal
 from models.signal_update import SignalUpdate, SignalUpdateType
 from services.management_proposal_service import (
@@ -53,6 +54,12 @@ from services.private_websocket import BitunixPrivateWebSocket
 from services.protection_service import ProtectionService
 from services.trade_journal import CsvTradeJournal, JournalEvent
 from services.market_service import MarketService
+from services.emulated_trigger_service import (
+    EmulatedTriggerService,
+    EmulatedTriggerStore,
+)
+from models.signal import TradeSignal
+from services.trade_planner import TradePlanner
 
 load_dotenv()
 
@@ -107,6 +114,7 @@ class FuturesBot:
             os.environ,
             self.execution.mode,
         )
+        self.triggers = TriggerConfig.from_env(os.environ)
         
         self.client = BitunixClient(
             api_key,
@@ -124,6 +132,7 @@ class FuturesBot:
         self.monitor = None
         self.websocket = None
         self.websocket_task = None
+        self.trigger_service = None
         self.execution_service = ExecutionService(
             self.order_service,
             self.account_service,
@@ -155,15 +164,6 @@ class FuturesBot:
                         "ордера на Bitunix."
                     ),
                 )
-        if not self.monitoring.enabled:
-            return
-        api_key = self.client.sig_gen.api_key
-        api_secret = self.client.sig_gen.api_secret
-        if not api_key or not api_secret:
-            raise ValueError(
-                "Bitunix credentials are required for monitoring"
-            )
-
         async def notify(
             text: str,
             action_id: str | None = None,
@@ -190,33 +190,95 @@ class FuturesBot:
                     text=text,
                     reply_markup=reply_markup,
                 )
+        if self.monitoring.enabled:
+            api_key = self.client.sig_gen.api_key
+            api_secret = self.client.sig_gen.api_secret
+            if not api_key or not api_secret:
+                raise ValueError(
+                    "Bitunix credentials are required for monitoring"
+                )
+            self.monitor = PositionMonitor(
+                self.order_service,
+                self.position_service,
+                self.protection_service,
+                self.journal,
+                notify,
+                self.market_service,
+                self.monitoring.taker_fee_rate,
+                auto_break_even_on_tp1=(
+                    self.monitoring.auto_break_even_on_tp1
+                ),
+            )
+            self.websocket = BitunixPrivateWebSocket(
+                api_key,
+                api_secret,
+                self.monitoring.websocket_url,
+                self.monitor.handle_event,
+                connected_handler=self.monitor.reconcile,
+                status_handler=notify,
+            )
+            self.websocket_task = asyncio.create_task(
+                self.websocket.run(),
+                name="bitunix-private-websocket",
+            )
 
-        self.monitor = PositionMonitor(
-            self.order_service,
-            self.position_service,
-            self.protection_service,
-            self.journal,
-            notify,
-            self.market_service,
-            self.monitoring.taker_fee_rate,
-            auto_break_even_on_tp1=(
-                self.monitoring.auto_break_even_on_tp1
-            ),
-        )
-        self.websocket = BitunixPrivateWebSocket(
-            api_key,
-            api_secret,
-            self.monitoring.websocket_url,
-            self.monitor.handle_event,
-            connected_handler=self.monitor.reconcile,
-            status_handler=notify,
-        )
-        self.websocket_task = asyncio.create_task(
-            self.websocket.run(),
-            name="bitunix-private-websocket",
-        )
+        if self.triggers.enabled:
+            async def register_execution(plan, result) -> None:
+                await asyncio.to_thread(
+                    self.journal.append,
+                    JournalEvent(
+                        event_type="execution",
+                        status=result.status,
+                        symbol=plan.symbol,
+                        side=plan.side.value,
+                        order_type=plan.order_type,
+                        entry_price=str(plan.current_price),
+                        quantity=str(plan.total_quantity),
+                        leverage=str(plan.leverage),
+                        risk_percent=str(plan.risk_percent),
+                        stop_loss=str(plan.stop_loss),
+                        take_profit=str(plan.take_profits[0].price),
+                        execution_id=plan.execution_id,
+                        mode=self.execution.mode.value,
+                        order_id=(
+                            result.orders[0].order_id
+                            if result.orders else ""
+                        ),
+                        simulated=str(result.simulated).lower(),
+                        error=result.error or "",
+                        source_event_id=(
+                            f"trigger:{plan.execution_id}:execution"
+                        ),
+                    ),
+                )
+                if self.monitor is None:
+                    return
+                client_ids = self.execution_service.client_ids(plan)
+                for order in result.orders:
+                    self.monitor.register_plan(
+                        client_ids[order.tp_number - 1],
+                        plan,
+                        tp_number=order.tp_number,
+                    )
+
+            self.trigger_service = EmulatedTriggerService(
+                self.market_service,
+                self.execution_service,
+                self.order_service,
+                self.position_service,
+                EmulatedTriggerStore(self.triggers.state_path),
+                notify,
+                register_execution,
+                poll_interval=self.triggers.poll_interval,
+                max_age_seconds=self.triggers.max_age_seconds,
+            )
+            suspended = await self.trigger_service.start()
+            for record in suspended:
+                await self._send_trigger_recovery(application, record)
 
     async def post_shutdown(self, application: Application) -> None:
+        if self.trigger_service is not None:
+            await self.trigger_service.stop()
         if self.websocket is not None:
             await self.websocket.stop()
         if self.websocket_task is not None:
@@ -225,6 +287,173 @@ class FuturesBot:
                 self.websocket_task,
                 return_exceptions=True,
             )
+
+    async def _send_trigger_recovery(self, application, record) -> None:
+        price = await self.trigger_service.price(record)
+        plan = record.plan
+        condition = (
+            f"LONG: последняя цена ≥ {plan.trigger_price}"
+            if plan.side.value == "LONG"
+            else f"SHORT: последняя цена ≤ {plan.trigger_price}"
+        )
+        age_minutes = max(0, int((time.time() - record.created_at) / 60))
+        tp_text = ", ".join(
+            f"TP{i} {tp.price} × {tp.quantity}"
+            for i, tp in enumerate(plan.take_profits, 1)
+        )
+        text = (
+            f"⚠️ Найден приостановленный триггер "
+            f"{plan.side.value} {plan.symbol}\n\n"
+            "Во время остановки бота цена могла пересечь уровень.\n"
+            "Автоматический вход не выполнен.\n\n"
+            f"Создан: {age_minutes} мин. назад\n"
+            f"Условие: {condition}\n"
+            f"Триггер: {plan.trigger_price}\n"
+            f"Диапазон сигнала: {plan.entry_min}–{plan.entry_max}\n"
+            f"Цена перед остановкой: {record.last_price or 'нет данных'}\n"
+            f"Текущая цена Bitunix: {price or 'недоступна'}\n"
+            f"После триггера: MARKET, объём {plan.total_quantity}\n"
+            f"SL: {plan.stop_loss}\n{tp_text}"
+        )
+        if price is None:
+            buttons = [[
+                InlineKeyboardButton(
+                    "🔄 Проверить снова",
+                    callback_data=f"trigger:retry:{plan.execution_id}",
+                ),
+                InlineKeyboardButton(
+                    "❌ Отменить",
+                    callback_data=f"trigger:cancel:{plan.execution_id}",
+                ),
+            ]]
+        elif record.condition_met(price):
+            text += (
+                "\n\n⚠️ Текущая цена уже прошла триггер. "
+                "Повторная активация заблокирована."
+            )
+            buttons = [[
+                InlineKeyboardButton(
+                    "🧮 Пересчитать вход сейчас",
+                    callback_data=(
+                        f"trigger:recalculate:{plan.execution_id}"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    "❌ Отменить триггер",
+                    callback_data=f"trigger:cancel:{plan.execution_id}",
+                ),
+            ]]
+        else:
+            buttons = [[
+                InlineKeyboardButton(
+                    "✅ Активировать заново",
+                    callback_data=f"trigger:rearm:{plan.execution_id}",
+                ),
+                InlineKeyboardButton(
+                    "❌ Отменить",
+                    callback_data=f"trigger:cancel:{plan.execution_id}",
+                ),
+            ]]
+        for chat_id in self.access.allowed_user_ids:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+
+    async def trigger_button_handler(self, update, context) -> None:
+        if not await self._authorize(update):
+            return
+        query = update.callback_query
+        await query.answer()
+        if self.trigger_service is None:
+            await query.edit_message_text("❌ Сервис триггеров выключен")
+            return
+        try:
+            _, action, execution_id = query.data.split(":", 2)
+        except ValueError:
+            await query.edit_message_text("❌ Некорректная кнопка")
+            return
+        record = self.trigger_service.get(execution_id)
+        if record is None:
+            await query.edit_message_text("❌ Триггер не найден")
+            return
+        if action == "cancel":
+            await self.trigger_service.cancel(execution_id)
+            await query.edit_message_text(
+                "❌ Триггер отменён; ордер на биржу не отправлялся"
+                if cancelled else "ℹ️ Триггер уже не активен"
+            )
+            return
+        if action == "retry":
+            await query.edit_message_text("🔄 Проверяю цену...")
+            await self._send_trigger_recovery(context.application, record)
+            return
+        if action == "rearm":
+            ok, message, price = await self.trigger_service.rearm(execution_id)
+            await query.edit_message_text(
+                f"{'✅' if ok else '⚠️'} {message}\n"
+                f"Текущая цена Bitunix: {price or 'недоступна'}"
+            )
+            return
+        if action != "recalculate":
+            await query.edit_message_text("❌ Неизвестное действие")
+            return
+        plan = record.plan
+        signal = TradeSignal(
+            symbol=plan.symbol,
+            side=plan.side,
+            entry_min=plan.entry_min,
+            entry_max=plan.entry_max,
+            take_profits=list(
+                plan.raw_take_profits
+                or tuple(item.price for item in plan.take_profits)
+            ),
+            stop_loss=plan.stop_loss,
+        )
+        try:
+            account = await asyncio.to_thread(
+                self.account_service.get_account, "USDT"
+            )
+            planner = TradePlanner(
+                self.market_service,
+                TradeSettings(
+                    leverage=plan.leverage,
+                    risk_percent=plan.risk_percent,
+                    max_tp_count=len(plan.take_profits),
+                    enable_emulated_triggers=False,
+                ),
+            )
+            new_plan = await asyncio.to_thread(
+                planner.create_plan, signal, account, force_market=True
+            )
+            proposal = TradeProposal.create(new_plan)
+            ProposalService.store(context.user_data, proposal)
+            cancelled = await self.trigger_service.cancel(execution_id)
+            text = (
+                f"🧮 Новый расчёт MARKET {new_plan.side.value} "
+                f"{new_plan.symbol}\n"
+                f"Текущая цена: {new_plan.current_price}\n"
+                f"Объём: {new_plan.total_quantity}\n"
+                f"SL: {new_plan.stop_loss}\n"
+                "Старый триггер отменён. Проверьте расчёт и подтвердите "
+                "в течение 5 минут."
+            )
+            keyboard = [[
+                InlineKeyboardButton(
+                    "✅ Войти MARKET",
+                    callback_data=f"enter:{proposal.proposal_id}",
+                ),
+                InlineKeyboardButton(
+                    "❌ Отмена",
+                    callback_data=f"cancel:{proposal.proposal_id}",
+                ),
+            ]]
+            await query.edit_message_text(
+                text, reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as error:
+            await query.edit_message_text(f"❌ Не удалось пересчитать: {error}")
 
     async def _authorize(self, update: Update) -> bool:
         user_id = update.effective_user.id if update.effective_user else None
@@ -876,6 +1105,9 @@ class FuturesBot:
             settings = TradeSettings(
                 leverage=leverage,
                 risk_percent=risk,
+                enable_emulated_triggers=getattr(
+                    getattr(self, "triggers", None), "enabled", True
+                ),
             )
             trade_service = TradeService(self.client, settings)
             account, existing_orders, existing_positions = (
@@ -938,6 +1170,13 @@ class FuturesBot:
                 f"{self._format_entry_range(signal)}\n"
             )
             text += f"Тип ордера: {order_info['order_type']}\n"
+            if plan.is_emulated_trigger:
+                text += (
+                    "⚠️ Это локальный триггер: до достижения цены "
+                    "ордер на Bitunix не существует. Он работает только "
+                    "пока бот запущен. После триггера будет отправлен "
+                    "MARKET-вход сразу с TP и SL.\n"
+                )
             text += f"Плановая цена входа: {planned_entry}\n"
             text += f"Объём: {total_qty}\n"
             text += f"Позиция: {position_value:.2f} USDT\n"
@@ -1114,6 +1353,45 @@ class FuturesBot:
         await query.edit_message_text("⏳ Вхожу в сделку...")
         
         try:
+            if proposal.plan.is_emulated_trigger:
+                if self.trigger_service is None:
+                    await query.edit_message_text(
+                        "❌ Сервис локальных триггеров выключен; "
+                        "ордер не отправлен"
+                    )
+                    return
+                record = await self.trigger_service.arm(proposal.plan)
+                await asyncio.to_thread(
+                    self.journal.append,
+                    JournalEvent(
+                        event_type="entry_trigger",
+                        status="ARMED",
+                        symbol=proposal.plan.symbol,
+                        side=proposal.plan.side.value,
+                        order_type="TRIGGER_MARKET",
+                        entry_price=str(proposal.plan.trigger_price),
+                        quantity=str(proposal.plan.total_quantity),
+                        stop_loss=str(proposal.plan.stop_loss),
+                        execution_id=proposal.plan.execution_id,
+                        source_event_id=(
+                            f"trigger:{proposal.plan.execution_id}:armed"
+                        ),
+                    ),
+                )
+                condition = (
+                    "≥" if proposal.plan.side.value == "LONG" else "≤"
+                )
+                await query.edit_message_text(
+                    "✅ Локальный триггер активирован\n\n"
+                    f"{proposal.plan.side.value} {proposal.plan.symbol}\n"
+                    f"Условие: цена Bitunix {condition} "
+                    f"{proposal.plan.trigger_price}\n"
+                    f"Последняя цена: {record.last_price}\n"
+                    "До срабатывания на бирже нет входного ордера.\n"
+                    "После срабатывания бот отправит MARKET-вход сразу "
+                    "с TP и SL. Это работает только пока бот запущен."
+                )
+                return
             execution_result = await asyncio.to_thread(
                 self.execution_service.execute,
                 proposal.plan,
@@ -2070,6 +2348,10 @@ def main():
     app.add_handler(CallbackQueryHandler(
         bot.break_even_button_handler,
         pattern=r"^breakeven:",
+    ))
+    app.add_handler(CallbackQueryHandler(
+        bot.trigger_button_handler,
+        pattern=r"^trigger:",
     ))
     app.add_handler(CallbackQueryHandler(
         bot.retry_three_tp_handler,

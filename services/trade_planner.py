@@ -142,6 +142,8 @@ class TradePlanner:
         self,
         signal: TradeSignal,
         account: AccountBalance,
+        *,
+        force_market: bool = False,
     ) -> TradePlan:
         ticker = self.market.get_ticker(signal.symbol)
         if not ticker:
@@ -168,9 +170,10 @@ class TradePlanner:
         entry_max = max(signal.entry_min, signal.entry_max)
         in_range = entry_min <= current_price <= entry_max
         limit_price = None
+        trigger_price = None
         market_price = Decimal(str(current_price))
         planned_entry = market_price
-        if not in_range:
+        if not in_range and not force_market:
             planned_entry = (
                 (
                     Decimal(str(entry_min))
@@ -186,15 +189,20 @@ class TradePlanner:
                 and planned_entry <= market_price
             )
             if immediately_executable:
-                raise TradePlanningError(
-                    "Автоматический вход заблокирован: обычный "
-                    f"{signal.side.value} LIMIT по цене "
-                    f"{planned_entry} при текущей цене Bitunix "
-                    f"{current_price} может исполниться немедленно. "
-                    "Для такого входа нужен Trigger/Stop-Limit; "
-                    "ордер не отправлен"
-                )
-            limit_price = float(planned_entry)
+                if not self.settings.enable_emulated_triggers:
+                    raise TradePlanningError(
+                        "Автоматический вход заблокирован: обычный "
+                        f"{signal.side.value} LIMIT по цене "
+                        f"{planned_entry} при текущей цене Bitunix "
+                        f"{current_price} может исполниться немедленно. "
+                        "Для такого входа нужен Trigger/Stop-Limit; "
+                        "ордер не отправлен"
+                    )
+                trigger_price = float(planned_entry)
+            else:
+                limit_price = float(planned_entry)
+        elif force_market:
+            in_range = True
 
         quantity, risk_budget = self._position_metrics(
             signal,
@@ -315,5 +323,7 @@ class TradePlanner:
             risk_percent=self.settings.risk_percent,
             risk_budget=float(risk_budget),
             limit_price=limit_price,
+            trigger_price=trigger_price,
+            raw_take_profits=tuple(selected_prices),
             api_execution_supported=instrument.api_supported,
         )

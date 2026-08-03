@@ -27,6 +27,14 @@ class ExecutionService:
         )
 
     def execute(self, plan: TradePlan) -> TradeExecutionResult:
+        if plan.is_emulated_trigger:
+            return TradeExecutionResult(
+                success=False,
+                error=(
+                    "Локальный триггер ещё не сработал; "
+                    "вход на биржу не отправлен"
+                ),
+            )
         if not plan.api_execution_supported:
             return TradeExecutionResult(
                 success=False,

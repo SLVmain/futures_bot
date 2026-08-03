@@ -18,4 +18,5 @@ __pycache__/
 
 *.log
 data/*.csv
+data/*.json
 *.egg-info/

@@ -365,24 +365,35 @@ def test_outside_range_creates_limit_plan_at_midpoint():
         (OrderSide.SHORT, 60, 55, [45, 40, 35]),
     ),
 )
-def test_rejects_limit_entry_that_can_execute_immediately(
+def test_creates_emulated_trigger_when_limit_would_execute_immediately(
     side,
     current_price,
     stop_loss,
     take_profits,
 ):
-    with pytest.raises(
-        TradePlanningError,
-        match=r"нужен Trigger/Stop-Limit; ордер не отправлен",
-    ):
-        make_planner(price=current_price).create_plan(
-            make_signal(
-                side=side,
-                stop_loss=stop_loss,
-                take_profits=take_profits,
-            ),
-            AccountBalance("USDT", "1000"),
-        )
+    plan = make_planner(price=current_price).create_plan(
+        make_signal(
+            side=side,
+            stop_loss=stop_loss,
+            take_profits=take_profits,
+        ),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.order_type == "TRIGGER_MARKET"
+    assert plan.trigger_price == 50
+    assert plan.limit_price is None
+    assert plan.in_range is False
+
+
+def test_can_disable_emulated_trigger_entries():
+    planner = TradePlanner(
+        FixedMarket(40),
+        TradeSettings(enable_emulated_triggers=False),
+    )
+
+    with pytest.raises(TradePlanningError, match="Trigger/Stop-Limit"):
+        planner.create_plan(make_signal(), AccountBalance("USDT", "1000"))
 
 
 def test_short_limit_above_market_remains_allowed():

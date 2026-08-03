@@ -26,6 +26,8 @@ class TradePlan:
     risk_percent: float
     risk_budget: float
     limit_price: float | None = None
+    trigger_price: float | None = None
+    raw_take_profits: tuple[float, ...] = ()
     api_execution_supported: bool = True
     execution_id: str = field(
         default_factory=lambda: uuid4().hex
@@ -34,14 +36,22 @@ class TradePlan:
     @property
     def planned_entry_price(self) -> float:
         return (
-            self.limit_price
+            self.trigger_price
+            if self.trigger_price is not None
+            else self.limit_price
             if self.limit_price is not None
             else self.current_price
         )
 
     @property
     def order_type(self) -> str:
+        if self.trigger_price is not None:
+            return "TRIGGER_MARKET"
         return "LIMIT" if self.limit_price is not None else "MARKET"
+
+    @property
+    def is_emulated_trigger(self) -> bool:
+        return self.trigger_price is not None
 
     @property
     def estimated_stop_loss(self) -> float:
@@ -69,6 +79,7 @@ class TradePlan:
             "planned_entry_price": self.planned_entry_price,
             "order_type": self.order_type,
             "limit_price": self.limit_price,
+            "trigger_price": self.trigger_price,
             "in_range": self.in_range,
             "total_quantity": self.total_quantity,
             "stop_loss": self.stop_loss,

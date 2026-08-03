@@ -6,6 +6,7 @@ class TradeSettings:
     risk_percent: float = 1.0   # Процент риска от депозита
     max_tp_count: int = 5       # Сколько тейков использовать (из сигнала)
     tp_offset_ticks: int = 2    # Сдвиг TP к входу в шагах цены
+    enable_emulated_triggers: bool = True
     
     # Распределение позиции по тейкам
     tp1_share: float = 0.5      # 50% на первый тейк
