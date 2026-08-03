@@ -63,9 +63,9 @@ def test_creates_immutable_trade_plan():
         0.4,
     )
     assert tuple(item.price for item in plan.take_profits) == (
-        55.0,
-        60.0,
-        65.0,
+        54.98,
+        59.98,
+        64.98,
     )
     assert plan.risk_budget == 10
     assert plan.estimated_stop_loss == 10
@@ -179,7 +179,7 @@ def test_two_take_profits_use_sixty_forty_distribution():
     )
 
     assert len(plan.take_profits) == 2
-    assert plan.take_profits[0].price == 55
+    assert plan.take_profits[0].price == 54.98
     assert [item.quantity for item in plan.take_profits] == [1.2, 0.8]
 
 
@@ -205,13 +205,42 @@ def test_instrument_precision_rounds_prices_conservatively():
 
     assert plan.stop_loss == 45.1
     assert [item.price for item in plan.take_profits] == [
-        55.0,
-        60.0,
-        65.0,
+        54.8,
+        59.8,
+        64.8,
     ]
     assert sum(
         item.quantity for item in plan.take_profits
     ) == plan.total_quantity
+
+
+def test_short_take_profits_are_shifted_two_ticks_higher():
+    instrument = TradingPair(
+        symbol="BTCUSDT",
+        min_trade_volume="0.001",
+        max_market_order_volume="100",
+        base_precision=3,
+        quote_precision=1,
+        min_leverage=1,
+        max_leverage=20,
+        symbol_status="OPEN",
+        api_supported=True,
+    )
+
+    plan = make_planner(instrument=instrument).create_plan(
+        make_signal(
+            side=OrderSide.SHORT,
+            stop_loss=55,
+            take_profits=[45.01, 40.01, 35.01],
+        ),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert [item.price for item in plan.take_profits] == [
+        45.3,
+        40.3,
+        35.3,
+    ]
 
 
 def test_rejects_leverage_above_instrument_limit():
@@ -273,7 +302,7 @@ def test_short_tp_error_contains_tp_and_current_price():
     with pytest.raises(
         TradePlanningError,
         match=(
-            r"TP1 расположен.*TP: 55\.00; цена входа: 50; "
+            r"TP1 расположен.*TP: 55\.02; цена входа: 50; "
             r"текущая цена Bitunix: 50"
         ),
     ):

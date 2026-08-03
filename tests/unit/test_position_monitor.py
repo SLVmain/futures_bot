@@ -663,9 +663,11 @@ def test_new_tp_cannot_exceed_remaining_position(tmp_path):
             "tpQty": "0.8",
         }]
 
-        await monitor._verify_plan_protections(
-            make_single_tp_plan(quantity=0.3)
+        plan = replace(
+            make_single_tp_plan(quantity=0.3),
+            total_quantity=1,
         )
+        await monitor._verify_plan_protections(plan)
 
         assert monitor.protections.placed == []
         assert "превышает остаток позиции" in notifications[-1]
@@ -710,9 +712,11 @@ def test_total_tp_quantity_allows_only_tiny_decimal_noise(tmp_path):
             "tpQty": "0.7000000001",
         }]
 
-        await monitor._verify_plan_protections(
-            make_single_tp_plan(quantity=0.3)
+        plan = replace(
+            make_single_tp_plan(quantity=0.3),
+            total_quantity=1,
         )
+        await monitor._verify_plan_protections(plan)
 
         assert monitor.protections.placed == []
         assert any(

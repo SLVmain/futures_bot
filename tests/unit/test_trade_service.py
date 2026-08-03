@@ -109,7 +109,11 @@ def test_prepare_order_uses_all_configured_take_profits():
     assert result["ready"] is True
     assert result["in_range"] is True
     assert result["total_quantity"] == 2.0
-    assert result["take_profits"] == [55.0, 60.0, 65.0]
+    assert result["take_profits"] == [
+        54.999998,
+        59.999998,
+        64.999998,
+    ]
     assert result["tp_quantities"] == [1.0, 0.6, 0.4]
     assert result["risk_budget"] == 10
     assert result["estimated_stop_loss"] == 10

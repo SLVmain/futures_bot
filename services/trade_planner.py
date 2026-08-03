@@ -215,6 +215,13 @@ class TradePlanner:
         ]
         if not selected_prices:
             raise TradePlanningError("Не указан тейк-профит")
+        if self.settings.tp_offset_ticks < 0:
+            raise TradePlanningError(
+                "Сдвиг тейк-профита не может быть отрицательным"
+            )
+        tp_offset = (
+            price_step * Decimal(self.settings.tp_offset_ticks)
+        )
         distributions = {
             1: (100,),
             2: (60, 40),
@@ -255,13 +262,18 @@ class TradePlanner:
             zip(selected_prices, tp_quantities),
             start=1,
         ):
-            price = Decimal(str(raw_price)).quantize(
+            normalized_price = Decimal(str(raw_price)).quantize(
                 price_step,
                 rounding=(
                     ROUND_DOWN
                     if signal.side is OrderSide.LONG
                     else ROUND_UP
                 ),
+            )
+            price = (
+                normalized_price - tp_offset
+                if signal.side is OrderSide.LONG
+                else normalized_price + tp_offset
             )
             invalid = (
                 signal.side is OrderSide.LONG
