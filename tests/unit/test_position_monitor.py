@@ -139,11 +139,92 @@ def test_order_event_is_journaled_notified_and_deduplicated(tmp_path):
         await monitor.handle_event(event)
 
         assert len(notifications) == 1
-        assert "Исполнен входной ордер" in notifications[0]
-        assert "Позиция: LONG BTCUSDT" in notifications[0]
-        assert "Средняя цена: 50.1" in notifications[0]
-        assert "Исполнено: 1" in notifications[0]
-        assert "Комиссия: 0.03" in notifications[0]
+        assert "Ордер исполнен: LONG BTCUSDT" in notifications[0]
+        assert "Цена: 50.1; объём: 1" in notifications[0]
+
+    asyncio.run(scenario())
+
+
+def test_split_entry_fills_are_combined_into_one_notification(tmp_path):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+
+        async def skip_protection_check(data):
+            return None
+
+        monitor._verify_attached_protections = skip_protection_check
+        for index in range(1, 4):
+            monitor.register_plan(
+                f"bot-execution-abc-{index}",
+                make_single_tp_plan(),
+            )
+
+        for index, price in enumerate(("50", "50.1", "49.9"), 1):
+            await monitor.handle_event({
+                "ch": "order",
+                "ts": 100 + index,
+                "data": {
+                    "orderId": f"order-{index}",
+                    "clientId": f"bot-execution-abc-{index}",
+                    "symbol": "BTCUSDT",
+                    "orderStatus": "FILLED",
+                    "side": "BUY",
+                    "averagePrice": price,
+                    "dealAmount": "1",
+                    "fee": "0.01",
+                },
+            })
+
+        assert notifications == [
+            "✅ LONG BTCUSDT открыт\n\n"
+            "Средняя цена: 50\n"
+            "Общий объём: 3\n"
+            "Комиссия входа: 0.03 USDT"
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_split_entry_protection_checks_are_combined(tmp_path):
+    notifications = []
+    monitor = make_monitor(tmp_path, notifications)
+    for index in range(1, 4):
+        monitor.register_plan(
+            f"bot-execution-abc-{index}",
+            make_single_tp_plan(),
+        )
+
+    assert monitor._mark_protection_verified(
+        "bot-execution-abc-1"
+    ) is None
+    assert monitor._mark_protection_verified(
+        "bot-execution-abc-2"
+    ) is None
+    assert monitor._mark_protection_verified(
+        "bot-execution-abc-3"
+    ) == (
+        "✅ Защита BTCUSDT проверена: TP1–TP3 активны; "
+        "SL задан во входных ордерах"
+    )
+
+
+def test_bot_position_open_event_is_suppressed(tmp_path):
+    async def scenario():
+        monitor = make_monitor(tmp_path, [])
+        monitor.register_plan("bot-execution-abc-1", make_single_tp_plan())
+
+        message = await monitor._notification(
+            "position",
+            {
+                "event": "OPEN",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+            },
+            "OPEN",
+        )
+
+        assert message is None
 
     asyncio.run(scenario())
 
@@ -268,6 +349,12 @@ def test_closed_position_writes_trade_summary(tmp_path):
             row for row in rows
             if row["event_type"] == "TRADE_SUMMARY"
         )
+        message = notifications[0]
+        assert "Позиция закрыта: SHORT BTCUSDT" in message
+        assert "Реализованный PnL: 5 USDT" in message
+        assert "Комиссия: -0.2 USDT" in message
+        assert "Funding: -0.1 USDT" in message
+        assert "Чистый результат: 4.7 USDT" in message
         assert summary["status"] == "CLOSED"
         assert summary["side"] == "SHORT"
         assert summary["pnl"] == "5"
@@ -275,6 +362,33 @@ def test_closed_position_writes_trade_summary(tmp_path):
         assert summary["funding"] == "-0.1"
         assert summary["net_pnl"] == "4.7"
         assert summary["remaining_quantity"] == "0"
+
+    asyncio.run(scenario())
+
+
+def test_closed_position_does_not_guess_missing_costs(tmp_path):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+
+        await monitor.handle_event({
+            "ch": "position",
+            "ts": 401,
+            "data": {
+                "event": "CLOSE",
+                "positionId": "position-2",
+                "symbol": "ETHUSDT",
+                "side": "BUY",
+                "realizedPNL": "2.5",
+            },
+        })
+
+        message = notifications[0]
+        assert "Позиция закрыта: LONG ETHUSDT" in message
+        assert "Реализованный PnL: 2.5 USDT" in message
+        assert "Комиссия: нет данных" in message
+        assert "Funding: нет данных" in message
+        assert "Чистый результат: нет данных" in message
 
     asyncio.run(scenario())
 
@@ -411,6 +525,10 @@ def test_filled_entry_only_verifies_attached_take_profits(tmp_path):
                 "clientId": "client-1",
                 "symbol": "BTCUSDT",
                 "orderStatus": "FILLED",
+                "side": "BUY",
+                "averagePrice": "50",
+                "dealAmount": "2",
+                "fee": "0.06",
             },
         })
 
@@ -423,7 +541,9 @@ def test_filled_entry_only_verifies_attached_take_profits(tmp_path):
             "Прикреплённый TP3 не найден" in message
             for message in notifications
         )
-        assert "Проверены прикреплённые TP: 1" in notifications[-1]
+        assert "Защита BTCUSDT проверена: TP1 активен" in (
+            notifications[-1]
+        )
         assert monitor._tp1_order_positions == {
             "tp-existing": "position-1",
         }
@@ -574,10 +694,7 @@ def test_partial_entries_are_matched_to_their_own_positions(
         assert "bot-execution-3" not in monitor._plans_by_client_id
         assert monitor._tp_orders["tp-3"] == ("position-3", 3)
         assert "tp-3" not in monitor._tp1_order_positions
-        assert notifications[-1] == (
-            "✅ Проверены прикреплённые TP: 1; "
-            "контроль TP3 активен"
-        )
+        assert notifications == []
 
     asyncio.run(scenario())
 

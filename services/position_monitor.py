@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 import time
 from uuid import uuid4
@@ -22,6 +22,18 @@ class BreakEvenProposal:
     trigger_position_id: str
     position_ids: tuple[str, ...]
     expires_at: float
+
+
+@dataclass
+class EntryFillGroup:
+    expected_client_ids: set[str]
+    symbol: str = ""
+    side: str = ""
+    filled_client_ids: set[str] = field(default_factory=set)
+    verified_client_ids: set[str] = field(default_factory=set)
+    quantity: Decimal = Decimal("0")
+    notional: Decimal = Decimal("0")
+    fee: Decimal = Decimal("0")
 
 
 class PositionMonitor:
@@ -68,6 +80,10 @@ class PositionMonitor:
         }
         self._break_even_proposals = {}
         self._pending_plan_notifications: set[str] = set()
+        self._entry_fill_groups: dict[str, EntryFillGroup] = {}
+        self._recent_bot_open_symbols: dict[str, float] = {}
+        for client_id, plan in self._plans_by_client_id.items():
+            self._register_entry_notification(client_id, plan.symbol)
 
     def register_plan(
         self,
@@ -86,12 +102,14 @@ class PositionMonitor:
             )
             self._tp_numbers_by_client_id[client_id] = tp_number
         self._plans_by_client_id[client_id] = plan
+        self._register_entry_notification(client_id, plan.symbol)
         if persist:
             self.journal.save_plan(client_id, plan)
 
     def discard_plan(self, client_id: str) -> None:
         self._plans_by_client_id.pop(client_id, None)
         self._tp_numbers_by_client_id.pop(client_id, None)
+        self._discard_entry_notification(client_id)
         self.journal.finish_plan(client_id, "FAILED")
 
     async def handle_event(self, message: dict) -> None:
@@ -375,10 +393,16 @@ class PositionMonitor:
                 "проверьте Bitunix."
             )
         if recovered:
-            await self.notifier(
-                f"✅ Проверены прикреплённые TP: {recovered}; "
-                f"контроль TP{first_tp_number} активен"
+            protection_message = self._mark_protection_verified(
+                client_id,
             )
+            if protection_message:
+                await self.notifier(protection_message)
+            elif not self._entry_group(client_id):
+                await self.notifier(
+                    f"✅ Проверены прикреплённые TP: {recovered}; "
+                    f"контроль TP{first_tp_number} активен"
+                )
         if not failed:
             if client_id:
                 self.journal.finish_plan(client_id, "CONFIGURED")
@@ -794,19 +818,20 @@ class PositionMonitor:
             description = descriptions.get(status)
             if description:
                 if status == "FILLED":
+                    entry_message = self._record_entry_fill(data)
+                    if entry_message is not None:
+                        return entry_message
+                    client_id = str(data.get("clientId", ""))
+                    if self._entry_group(client_id):
+                        return None
                     side = OpenPosition.normalize_side(
                         data.get("side", "")
                     )
                     return (
-                        "✅ Исполнен входной ордер\n\n"
-                        f"Позиция: {side} {symbol}\n"
-                        f"Тип: {data.get('type', '')}\n"
-                        "Средняя цена: "
-                        f"{data.get('averagePrice', '')}\n"
-                        "Исполнено: "
-                        f"{data.get('dealAmount', data.get('qty', ''))}\n"
-                        f"Комиссия: {data.get('fee', '')}\n"
-                        f"ID: {data.get('orderId', '')}"
+                        f"✅ Ордер исполнен: {side} {symbol}\n"
+                        f"Цена: {data.get('averagePrice', '')}; "
+                        "объём: "
+                        f"{data.get('dealAmount', data.get('qty', ''))}"
                     )
                 return (
                     f"ℹ️ {description}: {symbol}, "
@@ -815,14 +840,50 @@ class PositionMonitor:
         if channel == "position":
             event = str(data.get("event", ""))
             if event == "OPEN":
+                expires_at = self._recent_bot_open_symbols.get(
+                    symbol,
+                    0,
+                )
+                tracked = any(
+                    group.symbol == symbol
+                    for group in self._entry_fill_groups.values()
+                )
+                if tracked or expires_at > time.monotonic():
+                    return None
                 return (
                     f"✅ Позиция открыта: "
                     f"{data.get('side', '')} {symbol}"
                 )
             if event == "CLOSE":
+                realized = str(data.get("realizedPNL", ""))
+                fee = str(data.get("fee", ""))
+                funding = str(data.get("funding", ""))
+                net_pnl = self._net_pnl(realized, fee, funding)
+                side = OpenPosition.normalize_side(
+                    data.get("side", "")
+                )
+                net_text = (
+                    f"{net_pnl} USDT"
+                    if net_pnl is not None
+                    else "нет данных"
+                )
+                fee_text = self._expense_text(fee)
+                funding_text = (
+                    f"{funding} USDT"
+                    if funding
+                    else "нет данных"
+                )
+                realized_text = (
+                    f"{realized} USDT"
+                    if realized
+                    else "нет данных"
+                )
                 return (
-                    f"🏁 Позиция закрыта: {symbol}; "
-                    f"PnL: {data.get('realizedPNL', '')}"
+                    f"🏁 Позиция закрыта: {side} {symbol}\n"
+                    f"Реализованный PnL: {realized_text}\n"
+                    f"Комиссия: {fee_text}\n"
+                    f"Funding: {funding_text}\n"
+                    f"Чистый результат: {net_text}"
                 )
         if channel == "tpsl":
             if status == "FILLED":
@@ -891,6 +952,114 @@ class PositionMonitor:
                 )
         return None
 
+    def _register_entry_notification(
+        self,
+        client_id: str,
+        symbol: str,
+    ) -> None:
+        prefix = self._execution_client_prefix(client_id)
+        if not prefix:
+            return
+        group = self._entry_fill_groups.setdefault(
+            prefix,
+            EntryFillGroup(set(), symbol=symbol),
+        )
+        group.expected_client_ids.add(client_id)
+
+    def _entry_group(
+        self,
+        client_id: str,
+    ) -> EntryFillGroup | None:
+        prefix = self._execution_client_prefix(client_id)
+        return self._entry_fill_groups.get(prefix)
+
+    def _discard_entry_notification(self, client_id: str) -> None:
+        prefix = self._execution_client_prefix(client_id)
+        group = self._entry_fill_groups.get(prefix)
+        if group is None:
+            return
+        group.expected_client_ids.discard(client_id)
+        group.filled_client_ids.discard(client_id)
+        group.verified_client_ids.discard(client_id)
+        if not group.expected_client_ids:
+            self._entry_fill_groups.pop(prefix, None)
+
+    def _record_entry_fill(self, data: dict) -> str | None:
+        client_id = str(data.get("clientId", ""))
+        prefix = self._execution_client_prefix(client_id)
+        group = self._entry_fill_groups.get(prefix)
+        if group is None or client_id not in group.expected_client_ids:
+            return None
+        if client_id in group.filled_client_ids:
+            return None
+        try:
+            quantity = Decimal(str(
+                data.get("dealAmount", data.get("qty", ""))
+            ))
+            average_price = Decimal(str(data.get("averagePrice", "")))
+            fee = abs(Decimal(str(data.get("fee", "0") or "0")))
+        except InvalidOperation:
+            return (
+                "⚠️ Bitunix подтвердил часть входа, но вернул "
+                "некорректные цену, объём или комиссию. "
+                f"ID: {data.get('orderId', '')}"
+            )
+        group.symbol = str(data.get("symbol", group.symbol))
+        group.side = OpenPosition.normalize_side(data.get("side", ""))
+        group.quantity += quantity
+        group.notional += quantity * average_price
+        group.fee += fee
+        group.filled_client_ids.add(client_id)
+        self._recent_bot_open_symbols[group.symbol] = (
+            time.monotonic() + 60
+        )
+        if group.filled_client_ids != group.expected_client_ids:
+            return None
+        weighted_price = (
+            group.notional / group.quantity
+            if group.quantity
+            else Decimal("0")
+        )
+        message = (
+            f"✅ {group.side} {group.symbol} открыт\n\n"
+            f"Средняя цена: {self._decimal_text(weighted_price)}\n"
+            f"Общий объём: {self._decimal_text(group.quantity)}\n"
+            "Комиссия входа: "
+            f"{self._decimal_text(group.fee)} USDT"
+        )
+        if group.verified_client_ids == group.expected_client_ids:
+            self._entry_fill_groups.pop(prefix, None)
+        return message
+
+    def _mark_protection_verified(
+        self,
+        client_id: str,
+    ) -> str | None:
+        prefix = self._execution_client_prefix(client_id)
+        group = self._entry_fill_groups.get(prefix)
+        if group is None or client_id not in group.expected_client_ids:
+            return None
+        group.verified_client_ids.add(client_id)
+        if group.verified_client_ids != group.expected_client_ids:
+            return None
+        tp_numbers = sorted(
+            self._tp_number_from_client_id(item)
+            for item in group.expected_client_ids
+        )
+        tp_range = (
+            f"TP{tp_numbers[0]}"
+            if len(tp_numbers) == 1
+            else f"TP{tp_numbers[0]}–TP{tp_numbers[-1]}"
+        )
+        activity = "активен" if len(tp_numbers) == 1 else "активны"
+        message = (
+            f"✅ Защита {group.symbol} проверена: "
+            f"{tp_range} {activity}; SL задан во входных ордерах"
+        )
+        if group.filled_client_ids == group.expected_client_ids:
+            self._entry_fill_groups.pop(prefix, None)
+        return message
+
     def _journal_event_type(
         self,
         channel: str,
@@ -939,15 +1108,16 @@ class PositionMonitor:
         realized = str(data.get("realizedPNL", ""))
         fee = str(data.get("fee", ""))
         funding = str(data.get("funding", ""))
-        net_pnl = ""
-        try:
-            net_pnl = str(
-                Decimal(realized or "0")
-                + Decimal(funding or "0")
-                - abs(Decimal(fee or "0"))
-            )
-        except InvalidOperation:
-            pass
+        calculated_net_pnl = PositionMonitor._net_pnl(
+            realized,
+            fee,
+            funding,
+        )
+        net_pnl = (
+            str(calculated_net_pnl)
+            if calculated_net_pnl is not None
+            else ""
+        )
         position_id = str(data.get("positionId", ""))
         timestamp = str(message.get("ts", data.get("mtime", "")))
         return JournalEvent(
@@ -973,6 +1143,42 @@ class PositionMonitor:
                 f"trade-summary:{position_id}:{timestamp}"
             ),
         )
+
+    @staticmethod
+    def _net_pnl(
+        realized: str,
+        fee: str,
+        funding: str,
+    ) -> Decimal | None:
+        if not realized or not fee or not funding:
+            return None
+        try:
+            return (
+                Decimal(realized)
+                + Decimal(funding)
+                - abs(Decimal(fee))
+            )
+        except InvalidOperation:
+            return None
+
+    @staticmethod
+    def _expense_text(value: str) -> str:
+        if not value:
+            return "нет данных"
+        try:
+            expense = abs(Decimal(value))
+        except InvalidOperation:
+            return "нет данных"
+        if expense == 0:
+            return "0 USDT"
+        return f"-{expense} USDT"
+
+    @staticmethod
+    def _decimal_text(value: Decimal) -> str:
+        text = format(value, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text or "0"
 
     async def _position_after_execution(
         self,
