@@ -12,6 +12,7 @@ class MonitoringConfig:
     websocket_url: str | None
     journal_path: Path
     taker_fee_rate: Decimal
+    auto_break_even_on_tp1: bool
 
     @classmethod
     def from_env(
@@ -73,4 +74,18 @@ class MonitoringConfig:
             raise ValueError(
                 "FUTURES_TAKER_FEE_RATE must be between 0 and 1"
             )
-        return cls(enabled, websocket_url, path, taker_fee_rate)
+        raw_auto_break_even = environ.get(
+            "AUTO_BREAK_EVEN_ON_TP1",
+            "true",
+        ).strip().lower()
+        if raw_auto_break_even not in {"true", "false"}:
+            raise ValueError(
+                "AUTO_BREAK_EVEN_ON_TP1 must be true or false"
+            )
+        return cls(
+            enabled,
+            websocket_url,
+            path,
+            taker_fee_rate,
+            raw_auto_break_even == "true",
+        )

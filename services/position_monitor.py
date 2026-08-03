@@ -54,6 +54,7 @@ class PositionMonitor:
             2,
             4,
         ),
+        auto_break_even_on_tp1: bool = False,
     ):
         self.orders = orders
         self.positions = positions
@@ -63,6 +64,7 @@ class PositionMonitor:
         self.market = market
         self.taker_fee_rate = taker_fee_rate
         self.position_retry_delays = position_retry_delays
+        self.auto_break_even_on_tp1 = auto_break_even_on_tp1
         self._plans_by_client_id = journal.load_pending_plans()
         self._tp_numbers_by_client_id = {
             client_id: self._tp_number_from_client_id(client_id)
@@ -588,6 +590,26 @@ class PositionMonitor:
             expires_at=time.time() + 300,
         )
         self._break_even_proposals[proposal.proposal_id] = proposal
+        if self.auto_break_even_on_tp1:
+            try:
+                result = await self.confirm_break_even(
+                    proposal.proposal_id,
+                    True,
+                )
+            except Exception as error:
+                await self.notifier(
+                    "⚠️ TP1 исполнен, но автоматический перенос "
+                    "SL в безубыток не выполнен: "
+                    f"{type(error).__name__}. "
+                    "Проверьте оставшиеся позиции и SL на Bitunix."
+                )
+                return
+            await self.notifier(
+                "🎯 TP1 исполнен\n\n"
+                "✅ Автоматический перенос SL выполнен\n"
+                f"{result}"
+            )
+            return
         await self.notifier(
             "🎯 TP1 исполнен\n\n"
             f"Сигнал: {positions[0].side} {positions[0].symbol}\n"

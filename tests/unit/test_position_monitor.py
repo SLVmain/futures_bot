@@ -86,7 +86,7 @@ class FakeProtections:
         return order_id
 
 
-def make_monitor(tmp_path, notifications):
+def make_monitor(tmp_path, notifications, **kwargs):
     async def notify(message, action_id=None):
         notifications.append(message)
 
@@ -96,6 +96,7 @@ def make_monitor(tmp_path, notifications):
         FakeProtections(),
         CsvTradeJournal(tmp_path / "journal.csv"),
         notify,
+        **kwargs,
     )
 
 
@@ -892,6 +893,42 @@ def test_tp1_fill_requests_confirmation_before_moving_stop(
             ("sl-1", "50.03001803", "1")
         ]
         assert "50.03001803" in result
+
+    asyncio.run(scenario())
+
+
+def test_tp1_can_move_stop_to_break_even_automatically(
+    tmp_path,
+    run_blocking_calls_inline,
+):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(
+            tmp_path,
+            notifications,
+            auto_break_even_on_tp1=True,
+        )
+        monitor._tp1_order_positions["tp-1"] = "position-1"
+        monitor.protections.pending = [{
+            "id": "sl-1",
+            "positionId": "position-1",
+            "slPrice": "45",
+            "slQty": "1",
+        }]
+
+        await monitor._request_break_even({
+            "orderId": "tp-1",
+            "symbol": "BTCUSDT",
+        })
+
+        assert monitor.protections.modified == [
+            ("sl-1", "50.03001803", "1")
+        ]
+        assert monitor._break_even_proposals == {}
+        assert "Автоматический перенос SL выполнен" in (
+            notifications[-1]
+        )
+        assert "50.03001803" in notifications[-1]
 
     asyncio.run(scenario())
 

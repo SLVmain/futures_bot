@@ -106,6 +106,7 @@ ENABLE_PRIVATE_WEBSOCKET=false
 
 TRADE_JOURNAL_PATH=data/trade_journal.csv
 FUTURES_TAKER_FEE_RATE=0.0006
+AUTO_BREAK_EVEN_ON_TP1=true
 ```
 
 Не копируйте этот блок с незаменёнными значениями для рабочего запуска.
@@ -122,6 +123,7 @@ FUTURES_TAKER_FEE_RATE=0.0006
 | `ENABLE_PRIVATE_WEBSOCKET` | Приватный мониторинг: `true` или `false` |
 | `TRADE_JOURNAL_PATH` | Путь к локальному CSV-журналу |
 | `FUTURES_TAKER_FEE_RATE` | Комиссия taker в десятичном виде |
+| `AUTO_BREAK_EVEN_ON_TP1` | Автоперенос SL в fee-aware безубыток после TP1: `true` или `false` |
 | `TELEGRAM_PROXY` | Необязательный URL прокси для Telegram |
 
 Для `testnet` дополнительно требуются адреса тестовой среды:
@@ -175,6 +177,7 @@ ENABLE_PRIVATE_WEBSOCKET=true
 ```dotenv
 TRADING_MODE=live
 ENABLE_PRIVATE_WEBSOCKET=true
+AUTO_BREAK_EVEN_ON_TP1=true
 ```
 
 В этом режиме подтверждённые сделки создают реальные ордера. Для запуска
@@ -191,6 +194,11 @@ ENABLE_PRIVATE_WEBSOCKET=true
 видит live-режим, но приватный мониторинг не включён. Проверьте, что строка
 записана именно в `.env` проекта, без кавычек и опечаток, после чего полностью
 перезапустите процесс.
+
+При `AUTO_BREAK_EVEN_ON_TP1=true` бот после подтверждённого исполнения
+TP1 через приватный WebSocket автоматически переносит SL оставшихся частей
+сделки в fee-aware безубыток. Значение `false` сохраняет подтверждение через
+кнопку Telegram. По умолчанию автоматический перенос включён.
 
 ## Первый запуск
 

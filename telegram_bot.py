@@ -177,6 +177,9 @@ class FuturesBot:
             notify,
             self.market_service,
             self.monitoring.taker_fee_rate,
+            auto_break_even_on_tp1=(
+                self.monitoring.auto_break_even_on_tp1
+            ),
         )
         self.websocket = BitunixPrivateWebSocket(
             api_key,
@@ -873,6 +876,12 @@ class FuturesBot:
             )
         else:
             text = f"🛡️ Режим исполнения: {self.execution.mode.value}"
+        break_even_mode = (
+            "автоматически"
+            if self.monitoring.auto_break_even_on_tp1
+            else "с подтверждением"
+        )
+        text += f"\nSL после TP1: {break_even_mode}"
         await update.message.reply_text(text)
 
     async def positions(
