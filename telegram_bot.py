@@ -44,6 +44,7 @@ load_dotenv()
 
 WAITING_LEVERAGE = 1
 WAITING_RISK = 2
+WAITING_TP_STRATEGY = 3
 SIGNAL_KEY = "signal"
 LEVERAGE_KEY = "leverage"
 RISK_KEY = "risk"
@@ -364,6 +365,32 @@ class FuturesBot:
             ),
         ]])
 
+    @staticmethod
+    def _tp_strategy_options(signal) -> tuple[int, ...]:
+        count = len(signal.take_profits)
+        if count >= 5:
+            return (5, 3, 1)
+        if count == 4:
+            return (4, 3, 1)
+        if count == 3:
+            return (3, 1)
+        return tuple(dict.fromkeys((count, 1)))
+
+    @classmethod
+    def _tp_strategy_keyboard(cls, signal) -> InlineKeyboardMarkup:
+        labels = {
+            1: "Только TP1 — 100%",
+            3: "Первые 3 TP",
+            5: "Все 5 TP",
+        }
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                labels.get(count, f"Все {count} TP"),
+                callback_data=f"tp_strategy:{count}",
+            )]
+            for count in cls._tp_strategy_options(signal)
+        ])
+
     async def leverage_button_handler(
         self,
         update: Update,
@@ -423,8 +450,56 @@ class FuturesBot:
         await query.answer()
         risk = float(query.data.split(":", 1)[1])
         await query.edit_message_reply_markup(reply_markup=None)
+        signal = context.user_data.get(SIGNAL_KEY)
+        leverage = context.user_data.get(LEVERAGE_KEY)
+        if signal is None or leverage is None:
+            await query.message.reply_text(
+                "❌ Сессия устарела. Отправьте сигнал заново."
+            )
+            return ConversationHandler.END
+
+        context.user_data[RISK_KEY] = risk
+        await query.message.reply_text(
+            f"✅ Риск: {risk:g}%\n"
+            "Сколько тейков использовать?",
+            reply_markup=self._tp_strategy_keyboard(signal),
+        )
+        return WAITING_TP_STRATEGY
+
+    async def tp_strategy_button_handler(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        if not await self._authorize(update):
+            return ConversationHandler.END
+        query = update.callback_query
+        await query.answer()
+        signal = context.user_data.get(SIGNAL_KEY)
+        leverage = context.user_data.get(LEVERAGE_KEY)
+        risk = context.user_data.get(RISK_KEY)
+        if signal is None or leverage is None or risk is None:
+            await query.edit_message_text(
+                "❌ Сессия устарела. Отправьте сигнал заново."
+            )
+            return ConversationHandler.END
+
+        tp_count = int(query.data.split(":", 1)[1])
+        if tp_count not in self._tp_strategy_options(signal):
+            await query.edit_message_text(
+                "❌ Эта стратегия недоступна для текущего сигнала. "
+                "Отправьте сигнал заново."
+            )
+            return ConversationHandler.END
+
+        selected_signal = replace(
+            signal,
+            take_profits=list(signal.take_profits[:tp_count]),
+        )
+        context.user_data[SIGNAL_KEY] = selected_signal
+        await query.edit_message_reply_markup(reply_markup=None)
         progress_message = await query.message.reply_text(
-            "⏳ Считаю..."
+            f"✅ Выбрано TP: {tp_count}\n⏳ Считаю..."
         )
         return await self._calculate_selected_risk(
             query.message,
@@ -1423,6 +1498,12 @@ def main():
                 CallbackQueryHandler(
                     bot.risk_button_handler,
                     pattern=r"^risk:(1|2|3)$",
+                ),
+            ],
+            WAITING_TP_STRATEGY: [
+                CallbackQueryHandler(
+                    bot.tp_strategy_button_handler,
+                    pattern=r"^tp_strategy:(1|2|3|4|5)$",
                 ),
             ],
         },

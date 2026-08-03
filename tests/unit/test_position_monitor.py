@@ -3,11 +3,24 @@ import csv
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+
 from models.signal import OrderSide
 from models.trade import PlannedTakeProfit, TradePlan
 from services.position_monitor import PositionMonitor
 from services.trade_journal import CsvTradeJournal
 from tests.unit.test_protection_service import make_position
+
+
+@pytest.fixture
+def run_blocking_calls_inline(monkeypatch):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "services.position_monitor.asyncio.to_thread",
+        inline,
+    )
 
 
 class FakeOrders:
@@ -714,7 +727,10 @@ def test_total_tp_quantity_allows_only_tiny_decimal_noise(tmp_path):
     asyncio.run(scenario())
 
 
-def test_tp1_fill_requests_confirmation_before_moving_stop(tmp_path):
+def test_tp1_fill_requests_confirmation_before_moving_stop(
+    tmp_path,
+    run_blocking_calls_inline,
+):
     async def scenario():
         notifications = []
         monitor = make_monitor(tmp_path, notifications)
@@ -741,10 +757,9 @@ def test_tp1_fill_requests_confirmation_before_moving_stop(tmp_path):
 
         assert monitor.protections.modified == []
         assert "🎯 TP1 исполнен" in notifications[-1]
-        assert "Остаток: 1" in notifications[-1]
-        assert "Средняя цена: 50" in notifications[-1]
-        assert "Текущий SL: 45" in notifications[-1]
-        assert "Предлагаемый SL: 50.03001803" in notifications[-1]
+        assert "Оставшихся позиций: 1" in notifications[-1]
+        assert "position-1: объём 1" in notifications[-1]
+        assert "SL 45 → 50.03001803" in notifications[-1]
         proposal_id = next(iter(monitor._break_even_proposals))
 
         result = await monitor.confirm_break_even(
@@ -760,7 +775,10 @@ def test_tp1_fill_requests_confirmation_before_moving_stop(tmp_path):
     asyncio.run(scenario())
 
 
-def test_break_even_preserves_each_partial_stop_quantity(tmp_path):
+def test_break_even_preserves_each_partial_stop_quantity(
+    tmp_path,
+    run_blocking_calls_inline,
+):
     async def scenario():
         notifications = []
         monitor = make_monitor(tmp_path, notifications)
@@ -793,13 +811,17 @@ def test_break_even_preserves_each_partial_stop_quantity(tmp_path):
     asyncio.run(scenario())
 
 
-def test_break_even_confirmation_can_be_cancelled(tmp_path):
+def test_break_even_confirmation_can_be_cancelled(
+    tmp_path,
+    run_blocking_calls_inline,
+):
     async def scenario():
         notifications = []
         monitor = make_monitor(tmp_path, notifications)
         monitor._tp1_order_positions["tp-1"] = "position-1"
         monitor.protections.pending = [{
             "id": "sl-1",
+            "positionId": "position-1",
             "slPrice": "45",
         }]
 
@@ -816,13 +838,17 @@ def test_break_even_confirmation_can_be_cancelled(tmp_path):
     asyncio.run(scenario())
 
 
-def test_break_even_confirmation_expires_and_is_one_time(tmp_path):
+def test_break_even_confirmation_expires_and_is_one_time(
+    tmp_path,
+    run_blocking_calls_inline,
+):
     async def scenario():
         notifications = []
         monitor = make_monitor(tmp_path, notifications)
         monitor._tp1_order_positions["tp-1"] = "position-1"
         monitor.protections.pending = [{
             "id": "sl-1",
+            "positionId": "position-1",
             "slPrice": "45",
         }]
 
@@ -851,5 +877,97 @@ def test_break_even_confirmation_expires_and_is_one_time(tmp_path):
             raise AssertionError("Confirmation was reused")
 
         assert monitor.protections.modified == []
+
+    asyncio.run(scenario())
+
+
+def test_break_even_groups_only_remaining_positions_of_same_signal(
+    tmp_path,
+    run_blocking_calls_inline,
+):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        first = make_position()
+        second = replace(
+            first,
+            position_id="position-2",
+            quantity="0.3",
+            fee="0.01",
+        )
+        third = replace(
+            first,
+            position_id="position-3",
+            quantity="0.2",
+            fee="0.02",
+        )
+        unrelated = replace(
+            first,
+            position_id="position-other",
+            quantity="0.4",
+        )
+        monitor.positions.get_open_positions = lambda *args: (
+            second,
+            third,
+            unrelated,
+        )
+        monitor._tp_orders = {
+            "tp-1": ("position-1", 1),
+            "tp-2": ("position-2", 2),
+            "tp-3": ("position-3", 3),
+            "other-tp": ("position-other", 2),
+        }
+        monitor._tp1_order_positions = {
+            "tp-1": "position-1",
+        }
+        monitor._tp_order_client_ids = {
+            "tp-1": "bot-signal-a-1",
+            "tp-2": "bot-signal-a-2",
+            "tp-3": "bot-signal-a-3",
+            "other-tp": "bot-signal-b-2",
+        }
+        monitor.protections.pending = [
+            {
+                "id": "sl-2",
+                "positionId": "position-2",
+                "slPrice": "45",
+                "slQty": "0.3",
+            },
+            {
+                "id": "sl-3",
+                "positionId": "position-3",
+                "slPrice": "45",
+                "slQty": "0.2",
+            },
+            {
+                "id": "sl-other",
+                "positionId": "position-other",
+                "slPrice": "45",
+                "slQty": "0.4",
+            },
+        ]
+
+        await monitor._request_break_even({
+            "orderId": "tp-1",
+            "symbol": "BTCUSDT",
+        })
+        proposal_id = next(iter(monitor._break_even_proposals))
+        proposal = monitor._break_even_proposals[proposal_id]
+
+        assert proposal.position_ids == (
+            "position-2",
+            "position-3",
+        )
+        assert "position-other" not in notifications[-1]
+
+        result = await monitor.confirm_break_even(proposal_id, True)
+
+        assert [item[0] for item in monitor.protections.modified] == [
+            "sl-2",
+            "sl-3",
+        ]
+        assert "position-2" in result
+        assert "position-3" in result
+        assert "position-other" not in result
 
     asyncio.run(scenario())

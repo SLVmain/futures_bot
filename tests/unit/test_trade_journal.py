@@ -85,6 +85,10 @@ def test_journal_restores_all_take_profit_numbers(tmp_path):
     assert journal.load_active_tp1_orders() == {
         "tp-1": "position-1",
     }
+    assert journal.load_active_tp_order_client_ids() == {
+        "tp-1": "client-1",
+        "tp-2": "client-1",
+    }
 
 
 def test_existing_csv_schema_is_extended_without_data_loss(tmp_path):

@@ -286,6 +286,25 @@ class CsvTradeJournal:
             if tp_number == 1
         }
 
+    def load_active_tp_order_client_ids(self) -> dict[str, str]:
+        if not self.path.exists():
+            return {}
+        with self.path.open(
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as stream:
+            rows = list(csv.DictReader(stream))
+        return {
+            row["order_id"]: row.get("client_id", "")
+            for row in rows
+            if (
+                row.get("event_type") == "tp_order"
+                and row.get("order_id")
+                and row.get("client_id")
+            )
+        }
+
     def load_active_tp_orders(
         self,
     ) -> dict[str, tuple[str, int]]:

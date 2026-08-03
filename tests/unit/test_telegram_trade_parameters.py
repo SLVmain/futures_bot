@@ -3,10 +3,14 @@ from types import SimpleNamespace
 
 from telegram.ext import ConversationHandler
 
+from models.signal import OrderSide, TradeSignal
 from telegram_bot import (
     LEVERAGE_KEY,
+    RISK_KEY,
+    SIGNAL_KEY,
     WAITING_LEVERAGE,
     WAITING_RISK,
+    WAITING_TP_STRATEGY,
     FuturesBot,
 )
 
@@ -52,6 +56,17 @@ def make_bot():
 
     bot._authorize = authorize
     return bot
+
+
+def make_signal(tp_count):
+    return TradeSignal(
+        symbol="BTCUSDT",
+        side=OrderSide.LONG,
+        entry_min=100,
+        entry_max=101,
+        take_profits=list(range(102, 102 + tp_count)),
+        stop_loss=95,
+    )
 
 
 def test_leverage_and_risk_keyboards_have_only_requested_options():
@@ -109,7 +124,46 @@ def test_manual_leverage_button_waits_for_text_input():
     asyncio.run(scenario())
 
 
-def test_risk_button_passes_only_selected_value_to_calculation():
+def test_risk_button_stores_value_and_shows_five_tp_strategies():
+    async def scenario():
+        bot = make_bot()
+        query = FakeQuery("risk:3")
+        update = SimpleNamespace(callback_query=query)
+        context = SimpleNamespace(user_data={
+            SIGNAL_KEY: make_signal(5),
+            LEVERAGE_KEY: 15,
+        })
+
+        state = await bot.risk_button_handler(update, context)
+
+        assert state == WAITING_TP_STRATEGY
+        assert context.user_data[RISK_KEY] == 3.0
+        text, kwargs, _ = query.message.replies[-1]
+        assert "Сколько тейков использовать?" in text
+        assert [
+            row[0].callback_data
+            for row in kwargs["reply_markup"].inline_keyboard
+        ] == [
+            "tp_strategy:5",
+            "tp_strategy:3",
+            "tp_strategy:1",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_three_tp_signal_offers_first_or_all_three():
+    keyboard = FuturesBot._tp_strategy_keyboard(
+        make_signal(3)
+    )
+
+    assert [
+        row[0].callback_data
+        for row in keyboard.inline_keyboard
+    ] == ["tp_strategy:3", "tp_strategy:1"]
+
+
+def test_tp_strategy_uses_first_three_targets_before_calculation():
     async def scenario():
         bot = make_bot()
         selected = {}
@@ -120,21 +174,38 @@ def test_risk_button_passes_only_selected_value_to_calculation():
             context,
             risk,
         ):
+            selected["signal"] = context.user_data[SIGNAL_KEY]
             selected["risk"] = risk
-            selected["message"] = message
-            selected["progress"] = progress_message
             return ConversationHandler.END
 
         bot._calculate_selected_risk = calculate
-        query = FakeQuery("risk:3")
+        query = FakeQuery("tp_strategy:3")
         update = SimpleNamespace(callback_query=query)
-        context = SimpleNamespace(user_data={})
+        context = SimpleNamespace(user_data={
+            SIGNAL_KEY: make_signal(5),
+            LEVERAGE_KEY: 20,
+            RISK_KEY: 2.0,
+        })
 
-        state = await bot.risk_button_handler(update, context)
+        state = await bot.tp_strategy_button_handler(
+            update,
+            context,
+        )
 
         assert state == ConversationHandler.END
-        assert selected["risk"] == 3.0
-        assert selected["message"] is query.message
-        assert selected["progress"].text == "⏳ Считаю..."
+        assert selected["risk"] == 2.0
+        assert selected["signal"].take_profits == [102, 103, 104]
+        assert context.user_data[SIGNAL_KEY].take_profits == [
+            102,
+            103,
+            104,
+        ]
 
     asyncio.run(scenario())
+
+
+def test_single_tp_strategy_keeps_only_first_target():
+    signal = make_signal(3)
+
+    assert FuturesBot._tp_strategy_options(signal) == (3, 1)
+    assert signal.take_profits[:1] == [102]

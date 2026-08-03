@@ -19,7 +19,8 @@ POSITION_UNAVAILABLE = object()
 @dataclass(frozen=True)
 class BreakEvenProposal:
     proposal_id: str
-    position_id: str
+    trigger_position_id: str
+    position_ids: tuple[str, ...]
     expires_at: float
 
 
@@ -56,6 +57,9 @@ class PositionMonitor:
             for client_id in self._plans_by_client_id
         }
         self._tp_orders = journal.load_active_tp_orders()
+        self._tp_order_client_ids = (
+            journal.load_active_tp_order_client_ids()
+        )
         self._tp1_order_positions = {
             order_id: position_id
             for order_id, (position_id, tp_number)
@@ -323,6 +327,7 @@ class PositionMonitor:
                     client_id,
                     index,
                 )
+                self._tp_order_client_ids[tp_order_id] = client_id
                 if index == 1:
                     self._tp1_order_positions[tp_order_id] = (
                         position.position_id
@@ -475,66 +480,97 @@ class PositionMonitor:
         position_id = self._tp1_order_positions.get(order_id)
         if not position_id:
             return
-        positions = await asyncio.to_thread(
+        client_id = self._tp_order_client_ids.get(order_id, "")
+        execution_prefix = self._execution_client_prefix(client_id)
+        tracked_position_ids = {
+            tracked_position_id
+            for tracked_order_id, (tracked_position_id, tp_number)
+            in self._tp_orders.items()
+            if tp_number > 1
+            and self._execution_client_prefix(
+                self._tp_order_client_ids.get(tracked_order_id, "")
+            ) == execution_prefix
+            and execution_prefix
+        }
+        if not tracked_position_ids:
+            # Compatibility with journal entries created before client IDs
+            # were persisted for break-even grouping.
+            tracked_position_ids = {position_id}
+        open_positions = await asyncio.to_thread(
             self.positions.get_open_positions,
-            None,
-            position_id,
+            str(data.get("symbol", "")) or None,
+        )
+        positions = tuple(
+            position
+            for position in open_positions
+            if position.position_id in tracked_position_ids
         )
         if not positions:
+            await self.notifier(
+                "ℹ️ TP1 исполнен, но открытых частей этого сигнала "
+                "не осталось. Перенос SL не требуется."
+            )
             return
-        position = positions[0]
         quote_precision = 8
         if self.market is not None:
             instrument = await asyncio.to_thread(
                 self.market.get_trading_pair,
-                position.symbol,
+                positions[0].symbol,
             )
             quote_precision = instrument.quote_precision
-        break_even = ProtectionService.fee_aware_break_even(
-            position,
-            quote_precision,
-            self.taker_fee_rate,
-        )
-        protections = await asyncio.to_thread(
-            self.protections.get_pending_tp_sl,
-            position.symbol,
-            position_id,
-        )
-        stop_orders = [
-            item
-            for item in protections
-            if item.get("slPrice") and item.get("id")
-        ]
-        if not stop_orders:
-            await self.notifier(
-                "⚠️ TP1 исполнен, но активный SL не найден. "
-                "Проверьте позицию на Bitunix."
+        proposal_lines = []
+        for position in positions:
+            break_even = ProtectionService.fee_aware_break_even(
+                position,
+                quote_precision,
+                self.taker_fee_rate,
             )
-            return
+            protections = await asyncio.to_thread(
+                self.protections.get_pending_tp_sl,
+                position.symbol,
+                position.position_id,
+            )
+            stop_orders = [
+                item
+                for item in protections
+                if (
+                    str(item.get("positionId", ""))
+                    == position.position_id
+                    and item.get("slPrice")
+                    and item.get("id")
+                )
+            ]
+            if not stop_orders:
+                await self.notifier(
+                    "⚠️ TP1 исполнен, но активный SL не найден "
+                    f"для позиции {position.position_id}. "
+                    "Ни один SL не изменён; проверьте Bitunix."
+                )
+                return
+            current_stops = ", ".join(
+                str(item.get("slPrice"))
+                for item in stop_orders
+            )
+            proposal_lines.append(
+                f"• {position.position_id}: объём {position.quantity}, "
+                f"SL {current_stops} → {break_even}"
+            )
         proposal = BreakEvenProposal(
             proposal_id=uuid4().hex,
-            position_id=position_id,
+            trigger_position_id=position_id,
+            position_ids=tuple(
+                position.position_id for position in positions
+            ),
             expires_at=time.time() + 300,
         )
         self._break_even_proposals[proposal.proposal_id] = proposal
-        current_stops = ", ".join(
-            str(item.get("slPrice"))
-            for item in stop_orders
-        )
         await self.notifier(
             "🎯 TP1 исполнен\n\n"
-            f"Позиция: {position.side} {position.symbol}\n"
-            f"ID: {position.position_id}\n"
-            f"Остаток: {position.quantity}\n"
-            f"Плечо: {position.leverage}x\n"
-            f"Средняя цена: {position.average_open_price}\n"
-            f"Текущий SL: {current_stops}\n"
-            f"Предлагаемый SL: {break_even}\n"
-            f"Realized PnL: {position.realized_pnl}\n"
-            f"Unrealized PnL: {position.unrealized_pnl}\n"
-            f"Комиссии: {position.fee}\n"
-            f"Funding: {position.funding}\n\n"
-            "Перенести SL в fee-aware безубыток?",
+            f"Сигнал: {positions[0].side} {positions[0].symbol}\n"
+            f"Оставшихся позиций: {len(positions)}\n\n"
+            + "\n".join(proposal_lines)
+            + "\n\nПеренести SL всех оставшихся частей "
+            "в их fee-aware безубыток?",
             proposal.proposal_id,
         )
 
@@ -558,51 +594,72 @@ class PositionMonitor:
         if not confirm:
             return "SL оставлен без изменений"
 
-        positions = await asyncio.to_thread(
+        open_positions = await asyncio.to_thread(
             self.positions.get_open_positions,
-            None,
-            proposal.position_id,
+        )
+        positions = tuple(
+            position
+            for position in open_positions
+            if position.position_id in proposal.position_ids
         )
         if not positions:
-            raise ValueError("Позиция уже закрыта")
-        position = positions[0]
+            raise ValueError("Все позиции сигнала уже закрыты")
         quote_precision = 8
         if self.market is not None:
             instrument = await asyncio.to_thread(
                 self.market.get_trading_pair,
-                position.symbol,
+                positions[0].symbol,
             )
             quote_precision = instrument.quote_precision
-        break_even = ProtectionService.fee_aware_break_even(
-            position,
-            quote_precision,
-            self.taker_fee_rate,
-        )
-        protections = await asyncio.to_thread(
-            self.protections.get_pending_tp_sl,
-            position.symbol,
-            position.position_id,
-        )
-        stop_orders = [
-            item
-            for item in protections
-            if item.get("slPrice") and item.get("id")
-        ]
-        if not stop_orders:
-            raise ValueError("Активный SL не найден")
-        for stop_order in stop_orders:
-            stop_quantity = (
-                stop_order.get("slQty")
-                or stop_order.get("qty")
+        changes = []
+        break_even_by_position = {}
+        for position in positions:
+            break_even = ProtectionService.fee_aware_break_even(
+                position,
+                quote_precision,
+                self.taker_fee_rate,
             )
-            if not stop_quantity:
-                if len(stop_orders) == 1:
-                    stop_quantity = position.quantity
-                else:
-                    raise ValueError(
-                        "Bitunix не вернул объём частичного SL; "
-                        "перенос остановлен"
-                    )
+            break_even_by_position[position.position_id] = break_even
+            protections = await asyncio.to_thread(
+                self.protections.get_pending_tp_sl,
+                position.symbol,
+                position.position_id,
+            )
+            stop_orders = [
+                item
+                for item in protections
+                if (
+                    str(item.get("positionId", ""))
+                    == position.position_id
+                    and item.get("slPrice")
+                    and item.get("id")
+                )
+            ]
+            if not stop_orders:
+                raise ValueError(
+                    "Активный SL не найден для позиции "
+                    f"{position.position_id}; перенос остановлен"
+                )
+            for stop_order in stop_orders:
+                stop_quantity = (
+                    stop_order.get("slQty")
+                    or stop_order.get("qty")
+                )
+                if not stop_quantity:
+                    if len(stop_orders) == 1:
+                        stop_quantity = position.quantity
+                    else:
+                        raise ValueError(
+                            "Bitunix не вернул объём частичного SL; "
+                            "перенос остановлен"
+                        )
+                changes.append((
+                    position,
+                    stop_order,
+                    stop_quantity,
+                    break_even,
+                ))
+        for position, stop_order, stop_quantity, break_even in changes:
             await asyncio.to_thread(
                 self.protections.modify_stop_loss,
                 str(stop_order["id"]),
@@ -614,11 +671,15 @@ class PositionMonitor:
             JournalEvent(
                 event_type="break_even",
                 status="COMPLETED",
-                symbol=position.symbol,
-                position_id=position.position_id,
-                stop_loss=str(break_even),
+                symbol=positions[0].symbol,
+                position_id=proposal.trigger_position_id,
+                stop_loss=",".join(
+                    str(break_even_by_position[position_id])
+                    for position_id in proposal.position_ids
+                    if position_id in break_even_by_position
+                ),
                 source_event_id=(
-                    f"break-even:{position.position_id}"
+                    f"break-even:{proposal.trigger_position_id}"
                 ),
             ),
         )
@@ -626,12 +687,22 @@ class PositionMonitor:
             order_id: position_id
             for order_id, position_id
             in self._tp1_order_positions.items()
-            if position_id != position.position_id
+            if position_id != proposal.trigger_position_id
         }
         return (
-            "SL перенесён в fee-aware безубыток: "
-            f"{break_even}"
+            "SL перенесён в fee-aware безубыток для позиций: "
+            + ", ".join(
+                f"{position_id} → {break_even}"
+                for position_id, break_even
+                in break_even_by_position.items()
+            )
         )
+
+    @staticmethod
+    def _execution_client_prefix(client_id: str) -> str:
+        if not client_id or "-" not in client_id:
+            return ""
+        return client_id.rsplit("-", 1)[0]
 
     async def reconcile(self) -> None:
         orders, positions, protections = await asyncio.gather(
