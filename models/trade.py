@@ -26,6 +26,7 @@ class TradePlan:
     risk_percent: float
     risk_budget: float
     limit_price: float | None = None
+    api_execution_supported: bool = True
     execution_id: str = field(
         default_factory=lambda: uuid4().hex
     )
@@ -82,6 +83,7 @@ class TradePlan:
             "risk_budget": self.risk_budget,
             "estimated_stop_loss": self.estimated_stop_loss,
             "margin_required": self.margin_required,
+            "api_execution_supported": self.api_execution_supported,
         }
 
 

@@ -1,7 +1,10 @@
 import os
 import asyncio
+import hashlib
 import logging
+import re
 import sys
+import time
 from dataclasses import replace
 from io import BytesIO
 from dotenv import load_dotenv
@@ -12,10 +15,20 @@ from telegram import (
     Update,
 )
 from telegram.error import NetworkError
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 from core.api_client import BitunixClient
 from services.account_service import AccountService
 from services.signal_parser import SignalParser
+from services.signal_update_parser import SignalUpdateParser
 from services.trade_service import TradeService
 from config.settings import TradeSettings
 from config.execution import ExecutionConfig, ExecutionMode
@@ -29,6 +42,7 @@ from services.proposal_service import (
 from config.access import TelegramAccessConfig
 from config.monitoring import MonitoringConfig
 from models.management import ManagementAction, ManagementProposal
+from models.signal_update import SignalUpdate, SignalUpdateType
 from services.management_proposal_service import (
     ManagementProposalError,
     ManagementProposalService,
@@ -49,6 +63,13 @@ SIGNAL_KEY = "signal"
 LEVERAGE_KEY = "leverage"
 RISK_KEY = "risk"
 LOGGER = logging.getLogger(__name__)
+SIGNAL_UPDATE_PATTERN = re.compile(
+    r"(?:\bотмена\b|идея\s+закрыт|идея\s+закрыва|"
+    r"достигнут[ао]?\s+первая\s+цель|"
+    r"первая\s+цель\s+достигнут|"
+    r"закрыт[ао]?\s+из-за\s+противоположн)",
+    re.IGNORECASE,
+)
 
 
 async def telegram_error_handler(
@@ -107,6 +128,7 @@ class FuturesBot:
             self.order_service,
             self.account_service,
         )
+        self._recent_signal_updates: dict[str, float] = {}
 
     async def post_init(self, application: Application) -> None:
         await application.bot.set_my_commands([
@@ -246,7 +268,9 @@ class FuturesBot:
             "/close_position — закрыть позицию\n"
             "/ping — проверить работу бота\n"
             "/restart — перезапустить процесс\n\n"
-            "Для новой сделки просто отправьте текст сигнала."
+            "Для новой сделки просто отправьте текст сигнала.\n"
+            "Сообщения об отмене, TP1, стопе или закрытии идеи "
+            "обрабатываются как сопровождение существующей сделки."
         )
 
     async def ping(
@@ -280,6 +304,8 @@ class FuturesBot:
         message = update.message.text or update.message.caption
         
         if not message:
+            if update.message.photo:
+                return ConversationHandler.END
             await update.message.reply_text("❌ Не удалось прочитать сообщение.")
             return ConversationHandler.END
         
@@ -325,6 +351,306 @@ class FuturesBot:
             reply_markup=self._leverage_keyboard(),
         )
         return WAITING_LEVERAGE
+
+    async def handle_signal_update(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update):
+            raise ApplicationHandlerStop
+        message = update.effective_message
+        text = message.text or message.caption or ""
+        signal_update = SignalUpdateParser.parse(text)
+        if signal_update is None:
+            return
+        await self._process_signal_update(
+            update,
+            context,
+            signal_update,
+        )
+        raise ApplicationHandlerStop
+
+    async def _process_signal_update(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        signal_update: SignalUpdate,
+    ) -> None:
+        message = update.effective_message
+        fingerprint = hashlib.sha256(
+            " ".join(signal_update.raw_text.lower().split()).encode()
+        ).hexdigest()
+        recent_updates = getattr(self, "_recent_signal_updates", None)
+        if recent_updates is None:
+            recent_updates = {}
+            self._recent_signal_updates = recent_updates
+        now = time.monotonic()
+        self._recent_signal_updates = {
+            key: timestamp
+            for key, timestamp in recent_updates.items()
+            if now - timestamp < 600
+        }
+        if fingerprint in self._recent_signal_updates:
+            await message.reply_text(
+                "ℹ️ Это сопровождение уже было обработано."
+            )
+            return
+        source_event_id = self._signal_update_source_id(
+            update,
+            fingerprint,
+        )
+        written = await asyncio.to_thread(
+            self.journal.append,
+            JournalEvent(
+                event_type=signal_update.event_type.value,
+                status="RECEIVED",
+                symbol=signal_update.symbol,
+                entry_price=signal_update.reported_price,
+                pnl=(
+                    f"{signal_update.reported_percent}%"
+                    if signal_update.reported_percent
+                    else ""
+                ),
+                source_event_id=source_event_id,
+            ),
+        )
+        if not written:
+            await message.reply_text(
+                "ℹ️ Это сопровождение уже было обработано."
+            )
+            return
+        try:
+            orders, positions = await asyncio.gather(
+                asyncio.to_thread(
+                    self.order_service.get_pending_orders,
+                    signal_update.symbol,
+                ),
+                asyncio.to_thread(
+                    self.position_service.get_open_positions,
+                    signal_update.symbol,
+                ),
+            )
+        except Exception as error:
+            await self._journal_signal_update_status(
+                signal_update,
+                source_event_id,
+                "API_ERROR",
+                error=type(error).__name__,
+            )
+            await message.reply_text(
+                "⚠️ Не удалось проверить состояние Bitunix: "
+                f"{type(error).__name__}. Сигнал не привёл "
+                "к отмене или закрытию."
+            )
+            return
+        self._recent_signal_updates[fingerprint] = now
+        entry_orders = tuple(
+            order
+            for order in orders
+            if not order.reduce_only
+        )
+        if not orders and not positions:
+            await self._journal_signal_update_status(
+                signal_update,
+                source_event_id,
+                "NO_ACTIVE_TRADE",
+            )
+            await message.reply_text(
+                "ℹ️ Сопровождение сигнала пропущено\n\n"
+                f"Символ: {signal_update.symbol}\n"
+                "Открытых позиций и активных ордеров не найдено.\n"
+                "Возможно, бот не входил в сделку или она уже завершена."
+            )
+            return
+        if signal_update.event_type is SignalUpdateType.TP1_REPORTED:
+            await self._handle_reported_tp1(
+                message,
+                signal_update,
+                source_event_id,
+                positions,
+            )
+            return
+        close_positions = (
+            positions
+            if signal_update.requires_position_close
+            else ()
+        )
+        cancel_orders = (
+            entry_orders
+            if signal_update.requires_entry_cancellation
+            else ()
+        )
+        if not close_positions and not cancel_orders:
+            await self._journal_signal_update_status(
+                signal_update,
+                source_event_id,
+                "NO_APPLICABLE_ACTION",
+            )
+            detail = "Подходящих ожидающих входов для отмены нет."
+            if (
+                signal_update.event_type
+                is SignalUpdateType.CANCEL_ENTRY
+                and positions
+            ):
+                detail += " Открытая позиция не закрывается сигналом отмены."
+            await message.reply_text(
+                "ℹ️ Действие не требуется\n\n"
+                f"Символ: {signal_update.symbol}\n{detail}"
+            )
+            return
+        if close_positions and cancel_orders:
+            action = ManagementAction.CLOSE_AND_CANCEL
+        elif close_positions:
+            action = ManagementAction.CLOSE_POSITIONS
+        else:
+            action = ManagementAction.CANCEL_ORDERS
+        proposal = ManagementProposal.create_signal_action(
+            action,
+            signal_update.symbol,
+            order_ids=tuple(order.order_id for order in cancel_orders),
+            position_ids=tuple(
+                position.position_id for position in close_positions
+            ),
+            signal_event_type=signal_update.event_type.value,
+            source_event_id=source_event_id,
+        )
+        ManagementProposalService.store(context.user_data, proposal)
+        text = self._format_signal_action_proposal(
+            signal_update,
+            close_positions,
+            cancel_orders,
+        )
+        await self._send_management_confirmation(
+            update,
+            proposal,
+            text,
+        )
+
+    async def _handle_reported_tp1(
+        self,
+        message,
+        signal_update: SignalUpdate,
+        source_event_id: str,
+        positions,
+    ) -> None:
+        if not positions:
+            await self._journal_signal_update_status(
+                signal_update,
+                source_event_id,
+                "NO_ACTIVE_TRADE",
+            )
+            await message.reply_text(
+                "ℹ️ Автор сообщил о достижении TP1, но активная "
+                f"позиция {signal_update.symbol} не найдена.\n"
+                "Торговые действия не выполнялись."
+            )
+            return
+        await self._journal_signal_update_status(
+            signal_update,
+            source_event_id,
+            "INFORMATIONAL",
+        )
+        auto_mode = (
+            "включён"
+            if self.monitoring.auto_break_even_on_tp1
+            else "требует подтверждения"
+        )
+        await message.reply_text(
+            "ℹ️ Автор сообщил о достижении TP1\n\n"
+            f"Символ: {signal_update.symbol}\n"
+            f"Открытых позиций: {len(positions)}\n"
+            f"Автоперенос SL: {auto_mode}\n\n"
+            "Исполнение TP1 и перенос SL определяются только "
+            "по WebSocket-событию Bitunix. Повторный перенос не запускался."
+        )
+
+    async def _journal_signal_update_status(
+        self,
+        signal_update: SignalUpdate,
+        source_event_id: str,
+        status: str,
+        *,
+        error: str = "",
+    ) -> None:
+        await asyncio.to_thread(
+            self.journal.append,
+            JournalEvent(
+                event_type=signal_update.event_type.value,
+                status=status,
+                symbol=signal_update.symbol,
+                entry_price=signal_update.reported_price,
+                pnl=(
+                    f"{signal_update.reported_percent}%"
+                    if signal_update.reported_percent
+                    else ""
+                ),
+                error=error,
+                source_event_id=f"{source_event_id}:{status}",
+            ),
+        )
+
+    @staticmethod
+    def _signal_update_source_id(
+        update: Update,
+        fingerprint: str,
+    ) -> str:
+        chat = update.effective_chat
+        message = update.effective_message
+        chat_id = getattr(chat, "id", "unknown")
+        message_id = getattr(message, "message_id", None)
+        identity = message_id if message_id is not None else fingerprint
+        return f"telegram-signal-update:{chat_id}:{identity}"
+
+    @staticmethod
+    def _format_signal_action_proposal(
+        signal_update: SignalUpdate,
+        positions,
+        orders,
+    ) -> str:
+        labels = {
+            SignalUpdateType.CANCEL_ENTRY: "Отмена идеи",
+            SignalUpdateType.CLOSE_MARKET: "Закрытие по текущей цене",
+            SignalUpdateType.CLOSE_BREAK_EVEN: "Закрытие в безубытке",
+            SignalUpdateType.CLOSE_OPPOSITE: (
+                "Закрытие из-за противоположной сделки"
+            ),
+            SignalUpdateType.STOP_REPORTED: "Закрытие по стопу",
+        }
+        lines = [
+            "⚠️ Получено сопровождение сигнала",
+            "",
+            f"Символ: {signal_update.symbol}",
+            f"Событие: {labels[signal_update.event_type]}",
+        ]
+        if signal_update.reported_price:
+            lines.append(
+                f"Цена автора: {signal_update.reported_price}"
+            )
+        if signal_update.reported_percent:
+            lines.append(
+                f"Результат автора: {signal_update.reported_percent}%"
+            )
+        if positions:
+            lines.extend(("", "Позиции бота:"))
+            lines.extend(
+                f"• {item.side} {item.quantity}; вход "
+                f"{item.average_open_price}; PnL {item.unrealized_pnl}"
+                for item in positions
+            )
+        if orders:
+            lines.extend(("", f"Ожидающих входов к отмене: {len(orders)}"))
+        if len(positions) > 1:
+            lines.extend((
+                "",
+                "⚠️ Будут закрыты все перечисленные позиции по символу.",
+            ))
+        lines.extend((
+            "",
+            "Процент и цена автора справочные; фактический результат "
+            "будет получен с Bitunix.",
+        ))
+        return "\n".join(lines)
 
     @staticmethod
     def _leverage_keyboard() -> InlineKeyboardMarkup:
@@ -573,8 +899,13 @@ class FuturesBot:
                 signal,
                 account,
             )
-            proposal = TradeProposal.create(plan)
-            ProposalService.store(user_data, proposal)
+            manual_only = not plan.api_execution_supported
+            proposal = None
+            if manual_only:
+                ProposalService.discard(user_data)
+            else:
+                proposal = TradeProposal.create(plan)
+                ProposalService.store(user_data, proposal)
             order_info = plan.to_order_info()
             
             current = order_info["current_price"]
@@ -592,6 +923,12 @@ class FuturesBot:
                 sl_loss = (sl - planned_entry) * total_qty
             
             text = f"📊 *РАСЧЁТ*\n\n"
+            if manual_only:
+                text += (
+                    "⚠️ *РУЧНОЕ РАЗМЕЩЕНИЕ*\n"
+                    "Bitunix не поддерживает API-торговлю этим "
+                    "инструментом. Бот ничего не отправит на биржу.\n\n"
+                )
             text += f"Режим: `{self.execution.mode.value}`\n"
             text += f"*{signal.side.value} {order_info['symbol']}*\n"
             text += f"Плечо: {leverage}x | Риск: {risk}%\n"
@@ -628,7 +965,12 @@ class FuturesBot:
             
             await progress_message.delete()
             await message.reply_text(text, parse_mode='Markdown')
-            
+            if manual_only:
+                await message.reply_text(
+                    "ℹ️ Расчёт готов для ручного ввода на Bitunix. "
+                    "Кнопка автоматического входа отключена."
+                )
+                return
             keyboard = [
                 [
                     InlineKeyboardButton(
@@ -1316,12 +1658,32 @@ class FuturesBot:
             await query.edit_message_text(f"❌ {error}")
             return
         if decision == "cancel":
+            if proposal.signal_event_type:
+                await asyncio.to_thread(
+                    self.journal.append,
+                    JournalEvent(
+                        event_type=proposal.signal_event_type,
+                        status="ACTION_DECLINED",
+                        symbol=proposal.symbol or "",
+                        proposal_id=proposal.proposal_id,
+                        source_event_id=(
+                            f"{proposal.source_event_id}:declined:"
+                            f"{proposal.proposal_id}"
+                        ),
+                    ),
+                )
             await query.edit_message_text("❌ Операция отменена")
             return
 
         await query.edit_message_text("⏳ Выполняю...")
         try:
-            if proposal.action is ManagementAction.CANCEL_ORDER:
+            if proposal.action in {
+                ManagementAction.CANCEL_ORDERS,
+                ManagementAction.CLOSE_POSITIONS,
+                ManagementAction.CLOSE_AND_CANCEL,
+            }:
+                await self._execute_signal_management(query, proposal)
+            elif proposal.action is ManagementAction.CANCEL_ORDER:
                 orders = await asyncio.to_thread(
                     self.order_service.get_pending_orders,
                     proposal.symbol,
@@ -1350,7 +1712,7 @@ class FuturesBot:
                 await query.edit_message_text(
                     f"✅ Отмена ордера {status}"
                 )
-            else:
+            elif proposal.action is ManagementAction.CLOSE_POSITION:
                 positions = await asyncio.to_thread(
                     self.position_service.get_open_positions,
                     proposal.symbol,
@@ -1378,8 +1740,165 @@ class FuturesBot:
                 await query.edit_message_text(
                     f"✅ Закрытие позиции {status}"
                 )
+            else:
+                await query.edit_message_text(
+                    "❌ Неизвестный тип операции"
+                )
         except Exception as error:
+            if proposal.signal_event_type:
+                await asyncio.to_thread(
+                    self.journal.append,
+                    JournalEvent(
+                        event_type=proposal.signal_event_type,
+                        status="ACTION_ERROR",
+                        symbol=proposal.symbol or "",
+                        error=type(error).__name__,
+                        proposal_id=proposal.proposal_id,
+                        source_event_id=(
+                            f"{proposal.source_event_id}:action-error:"
+                            f"{proposal.proposal_id}"
+                        ),
+                    ),
+                )
             await query.edit_message_text(f"❌ Ошибка: {error}")
+
+    async def _execute_signal_management(
+        self,
+        query,
+        proposal: ManagementProposal,
+    ) -> None:
+        active_order_ids: tuple[str, ...] = ()
+        active_position_ids: tuple[str, ...] = ()
+        if proposal.order_ids:
+            orders = await asyncio.to_thread(
+                self.order_service.get_pending_orders,
+                proposal.symbol,
+            )
+            requested_order_ids = set(proposal.order_ids)
+            active_order_ids = tuple(
+                order.order_id
+                for order in orders
+                if (
+                    order.order_id in requested_order_ids
+                    and order.symbol.upper() == proposal.symbol
+                    and not order.reduce_only
+                )
+            )
+        if proposal.position_ids:
+            positions = await asyncio.to_thread(
+                self.position_service.get_open_positions,
+                proposal.symbol,
+            )
+            requested_position_ids = set(proposal.position_ids)
+            active_position_ids = tuple(
+                position.position_id
+                for position in positions
+                if (
+                    position.position_id in requested_position_ids
+                    and position.symbol.upper() == proposal.symbol
+                )
+            )
+        if not active_order_ids and not active_position_ids:
+            await asyncio.to_thread(
+                self.journal.append,
+                JournalEvent(
+                    event_type=proposal.signal_event_type,
+                    status="NO_LONGER_ACTIVE",
+                    symbol=proposal.symbol or "",
+                    proposal_id=proposal.proposal_id,
+                    source_event_id=(
+                        f"{proposal.source_event_id}:no-longer-active:"
+                        f"{proposal.proposal_id}"
+                    ),
+                ),
+            )
+            await query.edit_message_text(
+                "ℹ️ Позиции и ордера уже не активны. "
+                "Новые команды на Bitunix не отправлялись."
+            )
+            return
+        messages = []
+        simulated_results = []
+        if active_order_ids:
+            cancel_result = await asyncio.to_thread(
+                self.order_service.cancel_orders,
+                proposal.symbol,
+                active_order_ids,
+            )
+            simulated_results.append(cancel_result.simulated)
+            messages.append(
+                f"Ожидающих входов отменено/отправлено: "
+                f"{len(active_order_ids)}"
+            )
+            if cancel_result.failed:
+                messages.append(
+                    f"⚠️ Bitunix отклонил отмен: "
+                    f"{len(cancel_result.failed)}"
+                )
+                await asyncio.to_thread(
+                    self.journal.append,
+                    JournalEvent(
+                        event_type=proposal.signal_event_type,
+                        status="ACTION_PARTIAL",
+                        symbol=proposal.symbol or "",
+                        proposal_id=proposal.proposal_id,
+                        order_id=",".join(active_order_ids),
+                        error=(
+                            f"cancel failures: "
+                            f"{len(cancel_result.failed)}"
+                        ),
+                        simulated=str(cancel_result.simulated),
+                        source_event_id=(
+                            f"{proposal.source_event_id}:partial:"
+                            f"{proposal.proposal_id}"
+                        ),
+                    ),
+                )
+                await query.edit_message_text(
+                    "⚠️ Не все ожидающие входы удалось отменить.\n"
+                    "Закрытие позиции не отправлялось, чтобы "
+                    "оставшийся ордер не открыл её повторно.\n"
+                    "Проверьте ордера и позицию на Bitunix."
+                )
+                return
+        for position_id in active_position_ids:
+            close_result = await asyncio.to_thread(
+                self.position_service.close_position,
+                position_id,
+            )
+            simulated_results.append(close_result.simulated)
+        if active_position_ids:
+            messages.append(
+                f"Позиций закрыто/отправлено на закрытие: "
+                f"{len(active_position_ids)}"
+            )
+        simulated = bool(simulated_results) and all(simulated_results)
+        await asyncio.to_thread(
+            self.journal.append,
+            JournalEvent(
+                event_type=proposal.signal_event_type,
+                status="ACTION_COMPLETED",
+                symbol=proposal.symbol or "",
+                proposal_id=proposal.proposal_id,
+                order_id=",".join(active_order_ids),
+                position_id=",".join(active_position_ids),
+                simulated=str(simulated),
+                source_event_id=(
+                    f"{proposal.source_event_id}:action:"
+                    f"{proposal.proposal_id}"
+                ),
+            ),
+        )
+        mode_text = (
+            "Симуляция завершена."
+            if simulated
+            else "Команды отправлены; финальный статус ожидается."
+        )
+        await query.edit_message_text(
+            "✅ Сопровождение выполнено\n\n"
+            + "\n".join(messages)
+            + f"\n{mode_text}"
+        )
 
     async def break_even_button_handler(
         self,
@@ -1489,6 +2008,18 @@ def main():
     
     app = builder.build()
     app.add_error_handler(telegram_error_handler)
+
+    signal_update_filter = (
+        filters.Regex(SIGNAL_UPDATE_PATTERN)
+        | filters.CaptionRegex(SIGNAL_UPDATE_PATTERN)
+    )
+    app.add_handler(
+        MessageHandler(
+            signal_update_filter & ~filters.COMMAND,
+            bot.handle_signal_update,
+        ),
+        group=-1,
+    )
     
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler((filters.TEXT | filters.PHOTO | filters.CAPTION) & ~filters.COMMAND, bot.handle_signal)],

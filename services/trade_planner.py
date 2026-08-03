@@ -153,11 +153,6 @@ class TradePlanner:
             raise TradePlanningError(
                 f"Инструмент недоступен: {instrument.symbol_status}"
             )
-        if not instrument.api_supported:
-            raise TradePlanningError(
-                "Инструмент не поддерживает API-торговлю"
-            )
-
         price_step = Decimal("1").scaleb(
             -instrument.quote_precision
         )
@@ -320,4 +315,5 @@ class TradePlanner:
             risk_percent=self.settings.risk_percent,
             risk_budget=float(risk_budget),
             limit_price=limit_price,
+            api_execution_supported=instrument.api_supported,
         )

@@ -27,6 +27,14 @@ class ExecutionService:
         )
 
     def execute(self, plan: TradePlan) -> TradeExecutionResult:
+        if not plan.api_execution_supported:
+            return TradeExecutionResult(
+                success=False,
+                error=(
+                    "Инструмент не поддерживает API-торговлю; "
+                    "план предназначен только для ручного размещения"
+                ),
+            )
         if not plan.in_range and plan.limit_price is None:
             return TradeExecutionResult(
                 success=False,

@@ -117,6 +117,22 @@ def test_rejects_plan_outside_entry_range_without_orders():
     assert orders.calls == []
 
 
+def test_rejects_api_unsupported_manual_plan_without_side_effects():
+    orders = FakeOrderService()
+    account = FakeAccountService()
+    plan = TradePlan(**{
+        **make_plan().__dict__,
+        "api_execution_supported": False,
+    })
+
+    result = ExecutionService(orders, account).execute(plan)
+
+    assert result.success is False
+    assert "только для ручного размещения" in result.error
+    assert orders.calls == []
+    assert account.calls == []
+
+
 def test_outside_range_executes_limit_order_at_planned_price():
     orders = FakeOrderService()
     plan = make_plan(in_range=False)

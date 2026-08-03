@@ -68,6 +68,7 @@ def test_creates_immutable_trade_plan():
         64.98,
     )
     assert plan.risk_budget == 10
+    assert plan.api_execution_supported is True
     assert plan.estimated_stop_loss == 10
     assert plan.margin_required == 10
     assert market.calls == 1
@@ -212,6 +213,33 @@ def test_instrument_precision_rounds_prices_conservatively():
     assert sum(
         item.quantity for item in plan.take_profits
     ) == plan.total_quantity
+
+
+def test_api_unsupported_instrument_still_builds_manual_plan():
+    instrument = TradingPair(
+        symbol="BTCUSDT",
+        min_trade_volume="0.0001",
+        max_market_order_volume="50000",
+        base_precision=6,
+        quote_precision=2,
+        min_leverage=1,
+        max_leverage=125,
+        symbol_status="OPEN",
+        api_supported=False,
+    )
+
+    plan = make_planner(instrument=instrument).create_plan(
+        make_signal(),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.api_execution_supported is False
+    assert plan.total_quantity == 2
+    assert [item.price for item in plan.take_profits] == [
+        54.98,
+        59.98,
+        64.98,
+    ]
 
 
 def test_short_take_profits_are_shifted_two_ticks_higher():

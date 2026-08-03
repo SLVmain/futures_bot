@@ -3,7 +3,9 @@ from types import SimpleNamespace
 
 from telegram.ext import ConversationHandler
 
+from config.execution import ExecutionMode
 from models.signal import OrderSide, TradeSignal
+from models.trade import PlannedTakeProfit, TradePlan, TradeProposal
 from telegram_bot import (
     LEVERAGE_KEY,
     RISK_KEY,
@@ -29,9 +31,13 @@ class FakeProgressMessage:
     def __init__(self, text):
         self.text = text
         self.edits = []
+        self.deleted = False
 
     async def edit_text(self, text, **kwargs):
         self.edits.append((text, kwargs))
+
+    async def delete(self):
+        self.deleted = True
 
 
 class FakeQuery:
@@ -209,3 +215,71 @@ def test_single_tp_strategy_keeps_only_first_target():
 
     assert FuturesBot._tp_strategy_options(signal) == (3, 1)
     assert signal.take_profits[:1] == [102]
+
+
+def test_api_unsupported_plan_is_shown_without_entry_button(
+    monkeypatch,
+):
+    async def scenario():
+        bot = make_bot()
+        plan = TradePlan(
+            symbol="BTCUSDT",
+            side=OrderSide.LONG,
+            entry_min=49,
+            entry_max=51,
+            current_price=50,
+            in_range=True,
+            total_quantity=2,
+            stop_loss=45,
+            take_profits=(PlannedTakeProfit(55, 2),),
+            leverage=10,
+            risk_percent=1,
+            risk_budget=10,
+            api_execution_supported=False,
+        )
+
+        class ManualTradeService:
+            def __init__(self, client, settings):
+                pass
+
+            def build_plan(self, signal, account):
+                return plan
+
+        monkeypatch.setattr(
+            "telegram_bot.TradeService",
+            ManualTradeService,
+        )
+        bot.client = object()
+        bot.execution = SimpleNamespace(mode=ExecutionMode.LIVE)
+        bot.account_service = SimpleNamespace(
+            get_account=lambda coin: SimpleNamespace()
+        )
+        bot.order_service = SimpleNamespace(
+            get_pending_orders=lambda symbol: ()
+        )
+        bot.position_service = SimpleNamespace(
+            get_open_positions=lambda symbol: ()
+        )
+        message = FakeMessage()
+        progress = FakeProgressMessage("Считаю")
+        stale = TradeProposal.create(plan)
+        user_data = {"trade_proposal": stale}
+
+        await bot._calculate_and_send_proposal(
+            message,
+            progress,
+            user_data,
+            make_signal(1),
+            10,
+            1,
+        )
+
+        assert progress.deleted is True
+        assert "РУЧНОЕ РАЗМЕЩЕНИЕ" in message.replies[0][0]
+        assert "Кнопка автоматического входа отключена" in (
+            message.replies[1][0]
+        )
+        assert "reply_markup" not in message.replies[1][1]
+        assert "trade_proposal" not in user_data
+
+    asyncio.run(scenario())
