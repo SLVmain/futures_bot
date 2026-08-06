@@ -106,6 +106,7 @@ ENABLE_PRIVATE_WEBSOCKET=false
 
 TRADE_JOURNAL_PATH=data/trade_journal.csv
 FUTURES_TAKER_FEE_RATE=0.0006
+TAKE_PROFIT_OFFSET_TICKS=2
 AUTO_MOVE_STOP_LOSS_ON_TP1=true
 ENABLE_EMULATED_ENTRY_TRIGGERS=true
 TRIGGER_POLL_SECONDS=3
@@ -127,6 +128,7 @@ TRIGGER_STATE_PATH=data/emulated_triggers.json
 | `ENABLE_PRIVATE_WEBSOCKET` | Приватный мониторинг: `true` или `false` |
 | `TRADE_JOURNAL_PATH` | Путь к локальному CSV-журналу |
 | `FUTURES_TAKER_FEE_RATE` | Комиссия taker в десятичном виде |
+| `TAKE_PROFIT_OFFSET_TICKS` | Сдвиг каждого TP ближе к входу; `0` отключает сдвиг, по умолчанию `2` тика |
 | `AUTO_MOVE_STOP_LOSS_ON_TP1` | Автоматически перемещать SL в fee-aware безубыток после TP1: `true` или `false` |
 | `ENABLE_EMULATED_ENTRY_TRIGGERS` | Локальные условные входы для случаев, когда обычный LIMIT исполнился бы сразу |
 | `TRIGGER_POLL_SECONDS` | Интервал проверки цены активных локальных триггеров, минимум 1 секунда |

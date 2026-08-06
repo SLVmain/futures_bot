@@ -19,6 +19,9 @@ def main():
         leverage=1,        # плечо
         risk_percent=1.0,   # % риска от депозита
         max_tp_count=3,     # сколько тейков использовать
+        tp_offset_ticks=TradeSettings.take_profit_offset_from_env(
+            os.environ
+        ),
         tp1_share=0.5,      # 50% на первый тейк
         tp2_share=0.25,     # 25% на второй
         tp3_share=0.25,     # 25% на третий

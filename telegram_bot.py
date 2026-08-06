@@ -116,6 +116,9 @@ class FuturesBot:
             self.execution.mode,
         )
         self.triggers = TriggerConfig.from_env(os.environ)
+        self.take_profit_offset_ticks = (
+            TradeSettings.take_profit_offset_from_env(os.environ)
+        )
         
         self.client = BitunixClient(
             api_key,
@@ -274,6 +277,9 @@ class FuturesBot:
                 poll_interval=self.triggers.poll_interval,
                 max_age_seconds=self.triggers.max_age_seconds,
                 limit_offset_ticks=self.triggers.limit_offset_ticks,
+                take_profit_offset_ticks=(
+                    self.take_profit_offset_ticks
+                ),
             )
             suspended = await self.trigger_service.start()
             for record in suspended:
@@ -424,6 +430,11 @@ class FuturesBot:
                     leverage=plan.leverage,
                     risk_percent=plan.risk_percent,
                     max_tp_count=len(plan.take_profits),
+                    tp_offset_ticks=getattr(
+                        self,
+                        "take_profit_offset_ticks",
+                        2,
+                    ),
                     enable_emulated_triggers=False,
                 ),
             )
@@ -1108,6 +1119,11 @@ class FuturesBot:
             settings = TradeSettings(
                 leverage=leverage,
                 risk_percent=risk,
+                tp_offset_ticks=getattr(
+                    self,
+                    "take_profit_offset_ticks",
+                    2,
+                ),
                 enable_emulated_triggers=getattr(
                     getattr(self, "triggers", None), "enabled", True
                 ),

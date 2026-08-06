@@ -112,6 +112,7 @@ class EmulatedTriggerService:
         poll_interval: float = 3.0,
         max_age_seconds: float = 86400,
         limit_offset_ticks: int = 2,
+        take_profit_offset_ticks: int = 2,
     ):
         self.market = market_service
         self.execution = execution_service
@@ -124,6 +125,7 @@ class EmulatedTriggerService:
         self.poll_interval = poll_interval
         self.max_age_seconds = max_age_seconds
         self.limit_offset_ticks = limit_offset_ticks
+        self.take_profit_offset_ticks = take_profit_offset_ticks
         self.records = store.load()
         self._task = None
         self._stop = asyncio.Event()
@@ -382,6 +384,7 @@ class EmulatedTriggerService:
                 leverage=plan.leverage,
                 risk_percent=plan.risk_percent,
                 max_tp_count=len(plan.take_profits),
+                tp_offset_ticks=self.take_profit_offset_ticks,
                 enable_emulated_triggers=False,
             ),
         )
