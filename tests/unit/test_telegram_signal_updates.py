@@ -121,7 +121,7 @@ def make_bot(
     bot.order_service = FakeOrders(orders, error, cancel_failures)
     bot.position_service = FakePositions(positions)
     bot.monitor = None
-    bot.monitoring = SimpleNamespace(auto_break_even_on_tp1=True)
+    bot.monitoring = SimpleNamespace(auto_move_stop_loss_on_tp1=True)
     bot.journal = CsvTradeJournal(tmp_path / "journal.csv")
     bot._recent_signal_updates = {}
 
@@ -141,6 +141,34 @@ def parse(text):
 def journal_statuses(path):
     with path.open(encoding="utf-8", newline="") as stream:
         return [row["status"] for row in csv.DictReader(stream)]
+
+
+def test_trigger_cancel_button_reports_success(tmp_path):
+    class FakeTriggerService:
+        def __init__(self):
+            self.cancelled = []
+
+        def get(self, execution_id):
+            return SimpleNamespace()
+
+        async def cancel(self, execution_id):
+            self.cancelled.append(execution_id)
+            return True
+
+    async def scenario():
+        bot = make_bot(tmp_path)
+        bot.trigger_service = FakeTriggerService()
+        update = FakeUpdate(callback_data="trigger:cancel:execution-1")
+
+        await bot.trigger_button_handler(
+            update,
+            SimpleNamespace(user_data={}),
+        )
+
+        assert bot.trigger_service.cancelled == ["execution-1"]
+        assert "Триггер отменён" in update.callback_query.edits[-1][0]
+
+    asyncio.run(scenario())
 
 
 def test_missing_symbol_exposure_is_informational(tmp_path):

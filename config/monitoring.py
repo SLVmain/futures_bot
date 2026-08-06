@@ -12,7 +12,7 @@ class MonitoringConfig:
     websocket_url: str | None
     journal_path: Path
     taker_fee_rate: Decimal
-    auto_break_even_on_tp1: bool
+    auto_move_stop_loss_on_tp1: bool
 
     @classmethod
     def from_env(
@@ -74,18 +74,18 @@ class MonitoringConfig:
             raise ValueError(
                 "FUTURES_TAKER_FEE_RATE must be between 0 and 1"
             )
-        raw_auto_break_even = environ.get(
-            "AUTO_BREAK_EVEN_ON_TP1",
+        raw_auto_move_stop_loss = environ.get(
+            "AUTO_MOVE_STOP_LOSS_ON_TP1",
             "true",
         ).strip().lower()
-        if raw_auto_break_even not in {"true", "false"}:
+        if raw_auto_move_stop_loss not in {"true", "false"}:
             raise ValueError(
-                "AUTO_BREAK_EVEN_ON_TP1 must be true or false"
+                "AUTO_MOVE_STOP_LOSS_ON_TP1 must be true or false"
             )
         return cls(
             enabled,
             websocket_url,
             path,
             taker_fee_rate,
-            raw_auto_break_even == "true",
+            raw_auto_move_stop_loss == "true",
         )

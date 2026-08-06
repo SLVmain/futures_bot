@@ -54,7 +54,7 @@ class PositionMonitor:
             2,
             4,
         ),
-        auto_break_even_on_tp1: bool = False,
+        auto_move_stop_loss_on_tp1: bool = False,
     ):
         self.orders = orders
         self.positions = positions
@@ -64,7 +64,7 @@ class PositionMonitor:
         self.market = market
         self.taker_fee_rate = taker_fee_rate
         self.position_retry_delays = position_retry_delays
-        self.auto_break_even_on_tp1 = auto_break_even_on_tp1
+        self.auto_move_stop_loss_on_tp1 = auto_move_stop_loss_on_tp1
         self._plans_by_client_id = journal.load_pending_plans()
         self._tp_numbers_by_client_id = {
             client_id: self._tp_number_from_client_id(client_id)
@@ -590,7 +590,7 @@ class PositionMonitor:
             expires_at=time.time() + 300,
         )
         self._break_even_proposals[proposal.proposal_id] = proposal
-        if self.auto_break_even_on_tp1:
+        if self.auto_move_stop_loss_on_tp1:
             try:
                 result = await self.confirm_break_even(
                     proposal.proposal_id,

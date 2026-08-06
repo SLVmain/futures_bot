@@ -205,8 +205,8 @@ class FuturesBot:
                 notify,
                 self.market_service,
                 self.monitoring.taker_fee_rate,
-                auto_break_even_on_tp1=(
-                    self.monitoring.auto_break_even_on_tp1
+                auto_move_stop_loss_on_tp1=(
+                    self.monitoring.auto_move_stop_loss_on_tp1
                 ),
             )
             self.websocket = BitunixPrivateWebSocket(
@@ -379,7 +379,7 @@ class FuturesBot:
             await query.edit_message_text("❌ Триггер не найден")
             return
         if action == "cancel":
-            await self.trigger_service.cancel(execution_id)
+            cancelled = await self.trigger_service.cancel(execution_id)
             await query.edit_message_text(
                 "❌ Триггер отменён; ордер на биржу не отправлялся"
                 if cancelled else "ℹ️ Триггер уже не активен"
@@ -782,7 +782,7 @@ class FuturesBot:
         )
         auto_mode = (
             "включён"
-            if self.monitoring.auto_break_even_on_tp1
+            if self.monitoring.auto_move_stop_loss_on_tp1
             else "требует подтверждения"
         )
         await message.reply_text(
@@ -1498,7 +1498,7 @@ class FuturesBot:
             text = f"🛡️ Режим исполнения: {self.execution.mode.value}"
         break_even_mode = (
             "автоматически"
-            if self.monitoring.auto_break_even_on_tp1
+            if self.monitoring.auto_move_stop_loss_on_tp1
             else "с подтверждением"
         )
         text += f"\nSL после TP1: {break_even_mode}"

@@ -5,7 +5,7 @@
 Откройте Terminal на Mac и выполните:
 
 ```bash
-ssh -i ~/sshama/amazon.pem ubuntu@3.75.201.48
+ssh -i ~/sshama/amazon.pem ubuntu@<SERVER_IP>
 ```
 
 Если SSH впервые спросит, доверять ли серверу, введите `yes`.
@@ -16,9 +16,8 @@ ssh -i ~/sshama/amazon.pem ubuntu@3.75.201.48
 ubuntu@ip-172-26-8-170:~$
 ```
 
-Если Amazon изменит публичный IP-адрес сервера, замените `3.75.201.48` в
-команде на новый адрес из панели Lightsail. Чтобы этого не происходило,
-прикрепите к инстансу Static IP.
+Замените `<SERVER_IP>` на адрес из панели Lightsail. Чтобы адрес не менялся,
+прикрепите к инстансу Static IP. Конкретный адрес сервера не храните в Git.
 
 ## Подключение с другого компьютера
 
@@ -42,7 +41,7 @@ chmod 600 ~/.ssh/amazon.pem
 Подключитесь к серверу:
 
 ```bash
-ssh -i ~/.ssh/amazon.pem ubuntu@3.75.201.48
+ssh -i ~/.ssh/amazon.pem ubuntu@<SERVER_IP>
 ```
 
 Если SSH сообщает `UNPROTECTED PRIVATE KEY FILE`, ещё раз установите права:
@@ -92,7 +91,7 @@ cat ~/.ssh/id_ed25519.pub
 На первом компьютере подключитесь к серверу существующим ключом:
 
 ```bash
-ssh -i ~/sshama/amazon.pem ubuntu@3.75.201.48
+ssh -i ~/sshama/amazon.pem ubuntu@<SERVER_IP>
 ```
 
 Откройте список разрешённых публичных ключей:
@@ -116,14 +115,14 @@ chmod 600 ~/.ssh/authorized_keys
 ключ:
 
 ```bash
-ssh ubuntu@3.75.201.48
+ssh ubuntu@<SERVER_IP>
 ```
 
 Закрывайте старое подключение только после успешного входа с нового
 компьютера. Если ключ был сохранён под нестандартным именем, укажите путь:
 
 ```bash
-ssh -i ~/.ssh/имя_ключа ubuntu@3.75.201.48
+ssh -i ~/.ssh/имя_ключа ubuntu@<SERVER_IP>
 ```
 
 Для короткой команды подключения создайте на втором Mac файл
@@ -131,7 +130,7 @@ ssh -i ~/.ssh/имя_ключа ubuntu@3.75.201.48
 
 ```text
 Host futures-bot
-    HostName 3.75.201.48
+    HostName <SERVER_IP>
     User ubuntu
     IdentityFile ~/.ssh/id_ed25519
 ```
@@ -158,6 +157,39 @@ refactor/bitunix-safety
 ```
 
 ## Управление ботом
+
+### Установка системной службы
+
+Amazon использует отдельный серверный шаблон
+`deploy/futures-bot-server.service`. Ноутбучный файл
+`deploy/futures-bot.service` для сервера не подходит: в нём другой домашний
+каталог и используется блокировка сна ноутбука.
+
+Шаблон предполагает:
+
+- пользователя `ubuntu`;
+- проект в `/home/ubuntu/futures_bot`;
+- Python в `/home/ubuntu/futures_bot/venv/bin/python`.
+
+Если пути на сервере отличаются, сначала исправьте копию unit-файла. Затем
+установите службу:
+
+```bash
+cd ~/futures_bot
+sudo cp deploy/futures-bot-server.service \
+  /etc/systemd/system/futures-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now futures-bot
+```
+
+Проверьте, какой файл действительно загружен системой:
+
+```bash
+systemctl cat futures-bot
+systemctl status futures-bot --no-pager
+```
+
+После изменения unit-файла всегда выполняйте `sudo systemctl daemon-reload`.
 
 Запустить бот и включить автоматический запуск после перезагрузки:
 
@@ -219,7 +251,7 @@ journalctl -u futures-bot -f
 ```bash
 sudo systemctl stop futures-bot
 cd ~/futures_bot
-git pull origin refactor/bitunix-safety
+git pull --ff-only origin refactor/bitunix-safety
 ```
 
 Обновите зависимости и выполните тесты:
@@ -267,7 +299,13 @@ sudo systemctl restart futures-bot
 ```env
 TRADING_MODE=dry-run
 ENABLE_PRIVATE_WEBSOCKET=false
+AUTO_MOVE_STOP_LOSS_ON_TP1=true
+ENABLE_EMULATED_ENTRY_TRIGGERS=true
 ```
+
+Обе автоматические функции явно включены: после подтверждённого исполнения
+TP1 бот переносит SL в безубыток, а локальные триггерные планы могут отправить
+MARKET-вход при достижении цены. В `dry-run` реальные ордера не создаются.
 
 Перед включением `live` отдельно проверьте настройки риска, ключи API,
 доступ к Telegram и результаты работы в `dry-run`.

@@ -106,7 +106,7 @@ ENABLE_PRIVATE_WEBSOCKET=false
 
 TRADE_JOURNAL_PATH=data/trade_journal.csv
 FUTURES_TAKER_FEE_RATE=0.0006
-AUTO_BREAK_EVEN_ON_TP1=true
+AUTO_MOVE_STOP_LOSS_ON_TP1=true
 ENABLE_EMULATED_ENTRY_TRIGGERS=true
 TRIGGER_POLL_SECONDS=3
 TRIGGER_MAX_AGE_MINUTES=1440
@@ -127,7 +127,7 @@ TRIGGER_STATE_PATH=data/emulated_triggers.json
 | `ENABLE_PRIVATE_WEBSOCKET` | Приватный мониторинг: `true` или `false` |
 | `TRADE_JOURNAL_PATH` | Путь к локальному CSV-журналу |
 | `FUTURES_TAKER_FEE_RATE` | Комиссия taker в десятичном виде |
-| `AUTO_BREAK_EVEN_ON_TP1` | Автоперенос SL в fee-aware безубыток после TP1: `true` или `false` |
+| `AUTO_MOVE_STOP_LOSS_ON_TP1` | Автоматически перемещать SL в fee-aware безубыток после TP1: `true` или `false` |
 | `ENABLE_EMULATED_ENTRY_TRIGGERS` | Локальные условные входы для случаев, когда обычный LIMIT исполнился бы сразу |
 | `TRIGGER_POLL_SECONDS` | Интервал проверки цены активных локальных триггеров, минимум 1 секунда |
 | `TRIGGER_MAX_AGE_MINUTES` | Максимальный срок жизни локального триггера |
@@ -204,7 +204,7 @@ ENABLE_PRIVATE_WEBSOCKET=true
 ```dotenv
 TRADING_MODE=live
 ENABLE_PRIVATE_WEBSOCKET=true
-AUTO_BREAK_EVEN_ON_TP1=true
+AUTO_MOVE_STOP_LOSS_ON_TP1=true
 ```
 
 В этом режиме подтверждённые сделки создают реальные ордера. Для запуска
@@ -222,7 +222,7 @@ AUTO_BREAK_EVEN_ON_TP1=true
 записана именно в `.env` проекта, без кавычек и опечаток, после чего полностью
 перезапустите процесс.
 
-При `AUTO_BREAK_EVEN_ON_TP1=true` бот после подтверждённого исполнения
+При `AUTO_MOVE_STOP_LOSS_ON_TP1=true` бот после подтверждённого исполнения
 TP1 через приватный WebSocket автоматически переносит SL оставшихся частей
 сделки в fee-aware безубыток. Значение `false` сохраняет подтверждение через
 кнопку Telegram. По умолчанию автоматический перенос включён.
@@ -304,7 +304,7 @@ python telegram_bot.py
 
 Сообщение автора о TP1 не запускает перенос SL. Исполнение TP1 подтверждается
 только приватным WebSocket Bitunix, после чего действует настройка
-`AUTO_BREAK_EVEN_ON_TP1`.
+`AUTO_MOVE_STOP_LOSS_ON_TP1`.
 
 Если по символу нет ни позиции, ни ордера, бот сообщает об отсутствии
 активной сделки и ничего не отправляет на биржу. Ошибка API показывается

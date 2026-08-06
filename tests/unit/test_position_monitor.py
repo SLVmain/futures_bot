@@ -906,7 +906,7 @@ def test_tp1_can_move_stop_to_break_even_automatically(
         monitor = make_monitor(
             tmp_path,
             notifications,
-            auto_break_even_on_tp1=True,
+            auto_move_stop_loss_on_tp1=True,
         )
         monitor._tp1_order_positions["tp-1"] = "position-1"
         monitor.protections.pending = [{
