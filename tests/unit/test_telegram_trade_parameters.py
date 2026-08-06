@@ -220,6 +220,14 @@ def test_single_tp_strategy_keeps_only_first_target():
 def test_api_unsupported_plan_is_shown_without_entry_button(
     monkeypatch,
 ):
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "telegram_bot.asyncio.to_thread",
+        run_inline,
+    )
+
     async def scenario():
         bot = make_bot()
         plan = TradePlan(
@@ -236,6 +244,7 @@ def test_api_unsupported_plan_is_shown_without_entry_button(
             risk_percent=1,
             risk_budget=10,
             api_execution_supported=False,
+            trigger_price=52,
         )
 
         class ManualTradeService:
@@ -260,8 +269,15 @@ def test_api_unsupported_plan_is_shown_without_entry_button(
         bot.position_service = SimpleNamespace(
             get_open_positions=lambda symbol: ()
         )
-        message = FakeMessage()
         progress = FakeProgressMessage("Считаю")
+
+        class MessageBeforeProgressDeletion(FakeMessage):
+            async def reply_text(self, text, **kwargs):
+                if not self.replies:
+                    assert progress.deleted is False
+                return await super().reply_text(text, **kwargs)
+
+        message = MessageBeforeProgressDeletion()
         stale = TradeProposal.create(plan)
         user_data = {"trade_proposal": stale}
 
@@ -276,6 +292,9 @@ def test_api_unsupported_plan_is_shown_without_entry_button(
 
         assert progress.deleted is True
         assert "РУЧНОЕ РАЗМЕЩЕНИЕ" in message.replies[0][0]
+        assert "Тип ордера: TRIGGER\\_MARKET" in (
+            message.replies[0][0]
+        )
         assert "Кнопка автоматического входа отключена" in (
             message.replies[1][0]
         )

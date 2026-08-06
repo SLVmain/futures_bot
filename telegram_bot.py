@@ -86,9 +86,10 @@ async def telegram_error_handler(
     error = context.error
     if isinstance(error, NetworkError):
         LOGGER.warning(
-            "Telegram временно недоступен: %s. "
+            "Telegram временно недоступен: %s: %s. "
             "Повторное подключение выполняется автоматически.",
             type(error).__name__,
+            error,
         )
         return
     LOGGER.error(
@@ -1169,7 +1170,10 @@ class FuturesBot:
                 "Диапазон сигнала: "
                 f"{self._format_entry_range(signal)}\n"
             )
-            text += f"Тип ордера: {order_info['order_type']}\n"
+            order_type_text = str(
+                order_info["order_type"]
+            ).replace("_", r"\_")
+            text += f"Тип ордера: {order_type_text}\n"
             if plan.is_emulated_trigger:
                 text += (
                     "⚠️ Это локальный триггер: до достижения цены "
@@ -1202,8 +1206,8 @@ class FuturesBot:
                     profit = (planned_entry - tp) * qty
                 text += f"TP{i+1}: {tp} | {qty} ({share:.0f}%) | +{profit:.2f} USDT\n"
             
-            await progress_message.delete()
             await message.reply_text(text, parse_mode='Markdown')
+            await progress_message.delete()
             if manual_only:
                 await message.reply_text(
                     "ℹ️ Расчёт готов для ручного ввода на Bitunix. "
