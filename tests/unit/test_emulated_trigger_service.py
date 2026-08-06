@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -74,9 +75,37 @@ class MissingMarket:
         return None
 
 
+class SequenceMarket(Market):
+    def __init__(self, outcomes):
+        super().__init__(60)
+        self.outcomes = iter(outcomes)
+        self.ticker_calls = 0
+
+    def get_ticker(self, symbol):
+        self.ticker_calls += 1
+        outcome = next(self.outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return MarketTicker(symbol, outcome) if outcome is not None else None
+
+
 class EmptyOrders:
     def get_pending_orders(self, symbol):
         return ()
+
+
+class TrackedOrders(EmptyOrders):
+    def __init__(self):
+        self.pending = ()
+        self.cancelled = []
+
+    def get_pending_orders(self, symbol):
+        return self.pending
+
+    def cancel_orders(self, symbol, order_ids):
+        self.cancelled.append((symbol, order_ids))
+        self.pending = ()
+        return SimpleNamespace(failed=())
 
 
 class EmptyPositions:
@@ -103,7 +132,7 @@ class Executor:
         )
 
 
-def make_service(tmp_path, market, executor=None):
+def make_service(tmp_path, market, executor=None, orders=None, **settings):
     messages = []
     registered = []
 
@@ -117,12 +146,14 @@ def make_service(tmp_path, market, executor=None):
         market,
         executor or Executor(),
         Account(),
-        EmptyOrders(),
+        orders or EmptyOrders(),
         EmptyPositions(),
         EmulatedTriggerStore(tmp_path / "triggers.json"),
         notify,
         register,
         poll_interval=3600,
+        price_retry_delay=0,
+        **settings,
     )
     return service, messages, registered
 
@@ -170,13 +201,13 @@ def test_trigger_executes_aggressive_limit_plan_only_once(tmp_path):
             tmp_path, Market(51), executor
         )
         await service.arm(make_plan())
-        service.market.price = 49
+        service.market.price = 49.95
         record = service.get("trigger-one")
         await asyncio.gather(service._check(record), service._check(record))
 
         assert len(executor.plans) == 1
         assert executor.plans[0].order_type == "LIMIT"
-        assert executor.plans[0].limit_price == 48.98
+        assert executor.plans[0].limit_price == 49.93
         assert executor.plans[0].trigger_price is None
         assert service.get("trigger-one").status == "LIMIT_PLACED"
         assert len(registered) == 1
@@ -222,5 +253,85 @@ def test_active_trigger_suspends_when_price_becomes_unavailable(tmp_path):
 
         assert service.get("trigger-one").status == "SUSPENDED"
         assert "позднего входа не будет" in messages[0]
+
+    asyncio.run(scenario())
+
+
+def test_price_recovers_during_retries_without_warning(tmp_path):
+    async def scenario():
+        executor = Executor()
+        service, messages, _ = make_service(
+            tmp_path,
+            Market(60),
+            executor,
+            price_retry_count=3,
+        )
+        await service.arm(make_plan())
+        service.market = SequenceMarket(
+            (None, ConnectionError(), 49.95, 49.95)
+        )
+
+        await service._check(service.get("trigger-one"))
+
+        # Three checks belong to retry handling; the planner then reads the
+        # ticker once more while rebuilding risk for the resulting LIMIT.
+        assert service.market.ticker_calls == 4
+        assert len(executor.plans) == 1
+        assert not any("приостановлен" in item for item in messages)
+
+    asyncio.run(scenario())
+
+
+def test_trigger_blocks_entry_after_excessive_price_jump(tmp_path):
+    async def scenario():
+        executor = Executor()
+        service, messages, _ = make_service(
+            tmp_path, Market(60), executor
+        )
+        await service.arm(make_plan())
+        service.market.price = 49
+
+        await service._check(service.get("trigger-one"))
+
+        assert executor.plans == []
+        assert service.get("trigger-one").status == "SUSPENDED"
+        assert "цена ушла" in messages[0]
+
+    asyncio.run(scenario())
+
+
+def test_stale_trigger_limit_is_cancelled_by_exact_order_id(tmp_path):
+    async def scenario():
+        orders = TrackedOrders()
+        service, messages, _ = make_service(
+            tmp_path,
+            Market(60),
+            orders=orders,
+            limit_timeout_seconds=0.01,
+        )
+        await service.arm(make_plan())
+        service.market.price = 49.95
+        await service._check(service.get("trigger-one"))
+        orders.pending = (SimpleNamespace(order_id="order-1"),)
+        await asyncio.sleep(0.02)
+
+        assert orders.cancelled == [("BTCUSDT", ("order-1",))]
+        assert service.get("trigger-one").status == "LIMIT_TIMEOUT"
+        assert "отменено: 1" in messages[-1]
+
+    asyncio.run(scenario())
+
+
+def test_placed_order_identity_survives_store_reload(tmp_path):
+    async def scenario():
+        service, _, _ = make_service(tmp_path, Market(60))
+        await service.arm(make_plan())
+        service.market.price = 49.95
+        await service._check(service.get("trigger-one"))
+
+        restored, _, _ = make_service(tmp_path, Market(60))
+        record = restored.get("trigger-one")
+        assert record.order_ids == ("order-1",)
+        assert record.limit_placed_at is not None
 
     asyncio.run(scenario())

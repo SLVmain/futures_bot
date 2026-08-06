@@ -21,6 +21,8 @@ class EmulatedTrigger:
     created_at: float
     updated_at: float
     last_price: float | None = None
+    order_ids: tuple[str, ...] = ()
+    limit_placed_at: float | None = None
 
     def condition_met(self, price: float) -> bool:
         trigger = self.plan.trigger_price
@@ -69,6 +71,8 @@ class EmulatedTriggerStore:
             "created_at": record.created_at,
             "updated_at": record.updated_at,
             "last_price": record.last_price,
+            "order_ids": record.order_ids,
+            "limit_placed_at": record.limit_placed_at,
         }
 
     @staticmethod
@@ -87,6 +91,12 @@ class EmulatedTriggerStore:
             created_at=float(payload["created_at"]),
             updated_at=float(payload["updated_at"]),
             last_price=payload.get("last_price"),
+            order_ids=tuple(payload.get("order_ids", ())),
+            limit_placed_at=(
+                float(payload["limit_placed_at"])
+                if payload.get("limit_placed_at") is not None
+                else None
+            ),
         )
 
 
@@ -113,6 +123,10 @@ class EmulatedTriggerService:
         max_age_seconds: float = 86400,
         limit_offset_ticks: int = 2,
         take_profit_offset_ticks: int = 2,
+        price_retry_count: int = 3,
+        price_retry_delay: float = 3,
+        max_entry_deviation_percent: Decimal = Decimal("0.15"),
+        limit_timeout_seconds: float = 30,
     ):
         self.market = market_service
         self.execution = execution_service
@@ -126,10 +140,17 @@ class EmulatedTriggerService:
         self.max_age_seconds = max_age_seconds
         self.limit_offset_ticks = limit_offset_ticks
         self.take_profit_offset_ticks = take_profit_offset_ticks
+        self.price_retry_count = price_retry_count
+        self.price_retry_delay = price_retry_delay
+        self.max_entry_deviation_percent = Decimal(
+            max_entry_deviation_percent
+        )
+        self.limit_timeout_seconds = limit_timeout_seconds
         self.records = store.load()
         self._task = None
         self._stop = asyncio.Event()
         self._lock = asyncio.Lock()
+        self._limit_tasks: dict[str, asyncio.Task] = {}
 
     async def start(self) -> tuple[EmulatedTrigger, ...]:
         # An ARMED record came from an earlier process. The price may have
@@ -143,6 +164,9 @@ class EmulatedTriggerService:
                     updated_at=now,
                 )
         await asyncio.to_thread(self.store.save, self.records)
+        for execution_id, record in self.records.items():
+            if record.status in {"LIMIT_PLACED", "PARTIAL_PLACED"}:
+                self._schedule_limit_timeout(execution_id)
         self._task = asyncio.create_task(self._run(), name="entry-triggers")
         return self.suspended()
 
@@ -151,6 +175,14 @@ class EmulatedTriggerService:
         if self._task is not None:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
+        for task in self._limit_tasks.values():
+            task.cancel()
+        if self._limit_tasks:
+            await asyncio.gather(
+                *self._limit_tasks.values(),
+                return_exceptions=True,
+            )
+        self._limit_tasks.clear()
         now = time.time()
         for execution_id, record in tuple(self.records.items()):
             if record.status == self.ACTIVE:
@@ -203,11 +235,23 @@ class EmulatedTriggerService:
         except Exception:
             return None
 
+    async def price_with_retries(
+        self,
+        record: EmulatedTrigger,
+    ) -> float | None:
+        for attempt in range(self.price_retry_count):
+            price = await self.price(record)
+            if price is not None:
+                return price
+            if attempt + 1 < self.price_retry_count:
+                await asyncio.sleep(self.price_retry_delay)
+        return None
+
     async def rearm(self, execution_id: str) -> tuple[bool, str, float | None]:
         record = self.records.get(execution_id)
         if record is None or record.status != self.SUSPENDED:
             return False, "Триггер уже изменён или не найден", None
-        price = await self.price(record)
+        price = await self.price_with_retries(record)
         if price is None:
             return False, "Не удалось получить текущую цену Bitunix", None
         if time.time() - record.created_at > self.max_age_seconds:
@@ -261,7 +305,7 @@ class EmulatedTriggerService:
                 f"{record.plan.symbol} истёк; ордер не отправлен.",
             )
             return
-        price = await self.price(record)
+        price = await self.price_with_retries(record)
         if price is None:
             await self._finish(
                 record,
@@ -281,6 +325,23 @@ class EmulatedTriggerService:
             current, last_price=price, updated_at=time.time()
         )
         if not record.condition_met(price):
+            return
+        trigger_price = Decimal(str(record.plan.trigger_price))
+        deviation = (
+            abs(Decimal(str(price)) - trigger_price)
+            / trigger_price
+            * Decimal("100")
+        )
+        if deviation > self.max_entry_deviation_percent:
+            await self._finish(
+                record,
+                self.SUSPENDED,
+                price,
+                f"⚠️ Триггер {record.plan.side.value} "
+                f"{record.plan.symbol} достигнут, но цена ушла на "
+                f"{deviation:.3f}% от уровня. Вход не отправлен; "
+                "пересчитайте сделку по текущей цене.",
+            )
             return
         async with self._lock:
             current = self.records.get(record.plan.execution_id)
@@ -330,7 +391,17 @@ class EmulatedTriggerService:
             )
             if result.error:
                 text += f"\nОшибка: {result.error}"
-            await self._finish(record, status, price, text)
+            placed_at = time.time()
+            await self._finish(
+                record,
+                status,
+                price,
+                text,
+                order_ids=tuple(item.order_id for item in result.orders),
+                limit_placed_at=placed_at,
+            )
+            if result.orders:
+                self._schedule_limit_timeout(plan.execution_id)
         except Exception as error:
             await self._finish(
                 record,
@@ -398,11 +469,107 @@ class EmulatedTriggerService:
     async def _finish(
         self, record: EmulatedTrigger, status: str,
         price: float, message: str,
+        *,
+        order_ids: tuple[str, ...] | None = None,
+        limit_placed_at: float | None = None,
     ) -> None:
         async with self._lock:
+            changes = {
+                "status": status,
+                "last_price": price,
+                "updated_at": time.time(),
+            }
+            if order_ids is not None:
+                changes["order_ids"] = order_ids
+            if limit_placed_at is not None:
+                changes["limit_placed_at"] = limit_placed_at
             self.records[record.plan.execution_id] = replace(
-                record, status=status, last_price=price,
-                updated_at=time.time(),
+                record,
+                **changes,
             )
             await asyncio.to_thread(self.store.save, self.records)
+        await self.notify(message)
+
+    def _schedule_limit_timeout(self, execution_id: str) -> None:
+        existing = self._limit_tasks.get(execution_id)
+        if existing is not None and not existing.done():
+            return
+        self._limit_tasks[execution_id] = asyncio.create_task(
+            self._cancel_stale_limit(execution_id),
+            name=f"trigger-limit-timeout-{execution_id}",
+        )
+
+    async def _cancel_stale_limit(self, execution_id: str) -> None:
+        try:
+            record = self.records.get(execution_id)
+            if record is None or not record.order_ids:
+                return
+            placed_at = record.limit_placed_at or record.updated_at
+            remaining = max(
+                0,
+                self.limit_timeout_seconds - (time.time() - placed_at),
+            )
+            if remaining:
+                await asyncio.sleep(remaining)
+            pending = await asyncio.to_thread(
+                self.orders.get_pending_orders,
+                record.plan.symbol,
+            )
+            tracked = set(record.order_ids)
+            pending_ids = tuple(
+                item.order_id for item in pending
+                if item.order_id in tracked
+            )
+            if not pending_ids:
+                return
+            result = await asyncio.to_thread(
+                self.orders.cancel_orders,
+                record.plan.symbol,
+                pending_ids,
+            )
+            failed = len(result.failed)
+            if failed:
+                message = (
+                    "⚠️ Истёк срок LIMIT после триггера. "
+                    f"Не удалось отменить {failed} из {len(pending_ids)} "
+                    "остатков; проверьте Bitunix."
+                )
+                status = "LIMIT_CANCEL_PARTIAL"
+            else:
+                message = (
+                    "⌛ LIMIT после триггера не исполнился полностью за "
+                    f"{self.limit_timeout_seconds:g} сек. "
+                    f"Неисполненных остатков отменено: {len(pending_ids)}. "
+                    "Исполненная часть, если она есть, остаётся с TP и SL."
+                )
+                status = "LIMIT_TIMEOUT"
+            await self._set_timeout_status(execution_id, status, message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self._set_timeout_status(
+                execution_id,
+                "LIMIT_CANCEL_FAILED",
+                "⚠️ Не удалось проверить или отменить просроченный LIMIT "
+                f"после триггера: {type(error).__name__}. "
+                "Проверьте ордер на Bitunix вручную.",
+            )
+        finally:
+            self._limit_tasks.pop(execution_id, None)
+
+    async def _set_timeout_status(
+        self,
+        execution_id: str,
+        status: str,
+        message: str,
+    ) -> None:
+        async with self._lock:
+            current = self.records.get(execution_id)
+            if current is not None:
+                self.records[execution_id] = replace(
+                    current,
+                    status=status,
+                    updated_at=time.time(),
+                )
+                await asyncio.to_thread(self.store.save, self.records)
         await self.notify(message)

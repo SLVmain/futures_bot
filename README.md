@@ -111,6 +111,11 @@ AUTO_MOVE_STOP_LOSS_ON_TP1=true
 ENABLE_EMULATED_ENTRY_TRIGGERS=true
 TRIGGER_POLL_SECONDS=3
 TRIGGER_MAX_AGE_MINUTES=1440
+TRIGGER_LIMIT_OFFSET_TICKS=2
+TRIGGER_PRICE_RETRY_COUNT=3
+TRIGGER_PRICE_RETRY_DELAY_SECONDS=3
+TRIGGER_MAX_ENTRY_DEVIATION_PERCENT=0.15
+TRIGGER_LIMIT_TIMEOUT_SECONDS=30
 TRIGGER_STATE_PATH=data/emulated_triggers.json
 ```
 
@@ -134,6 +139,10 @@ TRIGGER_STATE_PATH=data/emulated_triggers.json
 | `TRIGGER_POLL_SECONDS` | Интервал проверки цены активных локальных триггеров, минимум 1 секунда |
 | `TRIGGER_MAX_AGE_MINUTES` | Максимальный срок жизни локального триггера |
 | `TRIGGER_LIMIT_OFFSET_TICKS` | Смещение LIMIT после триггера: LONG выше, SHORT ниже текущей цены; по умолчанию `2` тика |
+| `TRIGGER_PRICE_RETRY_COUNT` | Число попыток получить цену перед приостановкой триггера; по умолчанию `3` |
+| `TRIGGER_PRICE_RETRY_DELAY_SECONDS` | Пауза между повторными запросами цены; по умолчанию `3` секунды |
+| `TRIGGER_MAX_ENTRY_DEVIATION_PERCENT` | Максимально допустимое отклонение цены от триггера перед входом; по умолчанию `0.15%` |
+| `TRIGGER_LIMIT_TIMEOUT_SECONDS` | Через сколько секунд отменить неисполненный остаток LIMIT после триггера; по умолчанию `30` |
 | `TRIGGER_STATE_PATH` | JSON-файл состояния локальных триггеров; секретов не содержит |
 | `TELEGRAM_PROXY` | Необязательный URL прокси для Telegram |
 
@@ -154,7 +163,11 @@ BITUNIX_TESTNET_WEBSOCKET_URL=<testnet_websocket_url>
 проверяет цену Bitunix и при достижении середины диапазона отправляет пакет
 LIMIT-входов, каждый сразу со своим TP и SL. Для LONG цена LIMIT ставится выше
 текущей, для SHORT — ниже. Смещение задаётся в тиках, после чего объём заново
-рассчитывается по выбранному риску.
+рассчитывается от фактической LIMIT-цены и выбранного риска. Временный сбой
+цены проверяется три
+раза без уведомления после первой ошибки. Если цена ушла от триггера больше чем
+на `0.15%`, вход блокируется. Неисполненный остаток созданного ботом LIMIT
+отменяется через `30` секунд; другие ордера по символу отмена не затрагивает.
 
 До срабатывания на бирже нет ни входного ордера, ни позиции. Поэтому при
 выключенном боте сделка просто не откроется. После перезапуска сохранённые

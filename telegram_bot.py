@@ -280,6 +280,14 @@ class FuturesBot:
                 take_profit_offset_ticks=(
                     self.take_profit_offset_ticks
                 ),
+                price_retry_count=self.triggers.price_retry_count,
+                price_retry_delay=self.triggers.price_retry_delay,
+                max_entry_deviation_percent=(
+                    self.triggers.max_entry_deviation_percent
+                ),
+                limit_timeout_seconds=(
+                    self.triggers.limit_timeout_seconds
+                ),
             )
             suspended = await self.trigger_service.start()
             for record in suspended:
