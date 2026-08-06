@@ -86,10 +86,9 @@ async def telegram_error_handler(
     error = context.error
     if isinstance(error, NetworkError):
         LOGGER.warning(
-            "Telegram временно недоступен: %s: %s. "
+            "Telegram временно недоступен: %s. "
             "Повторное подключение выполняется автоматически.",
             type(error).__name__,
-            error,
         )
         return
     LOGGER.error(
