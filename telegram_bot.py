@@ -265,6 +265,7 @@ class FuturesBot:
             self.trigger_service = EmulatedTriggerService(
                 self.market_service,
                 self.execution_service,
+                self.account_service,
                 self.order_service,
                 self.position_service,
                 EmulatedTriggerStore(self.triggers.state_path),
@@ -272,6 +273,7 @@ class FuturesBot:
                 register_execution,
                 poll_interval=self.triggers.poll_interval,
                 max_age_seconds=self.triggers.max_age_seconds,
+                limit_offset_ticks=self.triggers.limit_offset_ticks,
             )
             suspended = await self.trigger_service.start()
             for record in suspended:
@@ -313,7 +315,7 @@ class FuturesBot:
             f"Диапазон сигнала: {plan.entry_min}–{plan.entry_max}\n"
             f"Цена перед остановкой: {record.last_price or 'нет данных'}\n"
             f"Текущая цена Bitunix: {price or 'недоступна'}\n"
-            f"После триггера: MARKET, объём {plan.total_quantity}\n"
+            "После триггера: агрессивный LIMIT с пересчётом объёма\n"
             f"SL: {plan.stop_loss}\n{tp_text}"
         )
         if price is None:
@@ -1179,7 +1181,7 @@ class FuturesBot:
                     "⚠️ Это локальный триггер: до достижения цены "
                     "ордер на Bitunix не существует. Он работает только "
                     "пока бот запущен. После триггера будет отправлен "
-                    "MARKET-вход сразу с TP и SL.\n"
+                    "LIMIT-вход с небольшим смещением, TP и SL.\n"
                 )
             text += f"Плановая цена входа: {planned_entry}\n"
             text += f"Объём: {total_qty}\n"
@@ -1372,7 +1374,7 @@ class FuturesBot:
                         status="ARMED",
                         symbol=proposal.plan.symbol,
                         side=proposal.plan.side.value,
-                        order_type="TRIGGER_MARKET",
+                        order_type="TRIGGER_LIMIT",
                         entry_price=str(proposal.plan.trigger_price),
                         quantity=str(proposal.plan.total_quantity),
                         stop_loss=str(proposal.plan.stop_loss),
@@ -1392,8 +1394,9 @@ class FuturesBot:
                     f"{proposal.plan.trigger_price}\n"
                     f"Последняя цена: {record.last_price}\n"
                     "До срабатывания на бирже нет входного ордера.\n"
-                    "После срабатывания бот отправит MARKET-вход сразу "
-                    "с TP и SL. Это работает только пока бот запущен."
+                    "После срабатывания бот отправит LIMIT-вход с "
+                    "небольшим смещением, TP и SL. Это работает только "
+                    "пока бот запущен."
                 )
                 return
             execution_result = await asyncio.to_thread(

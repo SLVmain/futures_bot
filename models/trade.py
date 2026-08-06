@@ -46,7 +46,7 @@ class TradePlan:
     @property
     def order_type(self) -> str:
         if self.trigger_price is not None:
-            return "TRIGGER_MARKET"
+            return "TRIGGER_LIMIT"
         return "LIMIT" if self.limit_price is not None else "MARKET"
 
     @property

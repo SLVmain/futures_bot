@@ -1,6 +1,8 @@
 import asyncio
 
-from core.api_models import MarketTicker
+import pytest
+
+from core.api_models import AccountBalance, MarketTicker, TradingPair
 from models.signal import OrderSide
 from models.trade import (
     PlacedOrder,
@@ -14,7 +16,19 @@ from services.emulated_trigger_service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def run_blocking_calls_inline(monkeypatch):
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "services.emulated_trigger_service.asyncio.to_thread",
+        inline,
+    )
+
+
 def make_plan(side=OrderSide.SHORT):
+    take_profit = 45 if side is OrderSide.SHORT else 55
     return TradePlan(
         symbol="BTCUSDT",
         side=side,
@@ -24,12 +38,12 @@ def make_plan(side=OrderSide.SHORT):
         in_range=False,
         total_quantity=2,
         stop_loss=55 if side is OrderSide.SHORT else 45,
-        take_profits=(PlannedTakeProfit(45, 2),),
+        take_profits=(PlannedTakeProfit(take_profit, 2),),
         leverage=10,
         risk_percent=1,
         risk_budget=10,
         trigger_price=50,
-        raw_take_profits=(45,),
+        raw_take_profits=(take_profit,),
         execution_id="trigger-one",
     )
 
@@ -40,6 +54,19 @@ class Market:
 
     def get_ticker(self, symbol):
         return MarketTicker(symbol, self.price)
+
+    def get_trading_pair(self, symbol):
+        return TradingPair(
+            symbol=symbol,
+            min_trade_volume="0.001",
+            max_market_order_volume="100000",
+            base_precision=3,
+            quote_precision=2,
+            min_leverage=1,
+            max_leverage=125,
+            symbol_status="OPEN",
+            api_supported=True,
+        )
 
 
 class MissingMarket:
@@ -55,6 +82,11 @@ class EmptyOrders:
 class EmptyPositions:
     def get_open_positions(self, symbol):
         return ()
+
+
+class Account:
+    def get_account(self, margin_coin):
+        return AccountBalance(margin_coin, "1000")
 
 
 class Executor:
@@ -84,6 +116,7 @@ def make_service(tmp_path, market, executor=None):
     service = EmulatedTriggerService(
         market,
         executor or Executor(),
+        Account(),
         EmptyOrders(),
         EmptyPositions(),
         EmulatedTriggerStore(tmp_path / "triggers.json"),
@@ -130,7 +163,7 @@ def test_rearm_is_blocked_if_price_crossed_while_offline(tmp_path):
     asyncio.run(scenario())
 
 
-def test_trigger_executes_market_plan_only_once(tmp_path):
+def test_trigger_executes_aggressive_limit_plan_only_once(tmp_path):
     async def scenario():
         executor = Executor()
         service, messages, registered = make_service(
@@ -142,13 +175,29 @@ def test_trigger_executes_market_plan_only_once(tmp_path):
         await asyncio.gather(service._check(record), service._check(record))
 
         assert len(executor.plans) == 1
-        assert executor.plans[0].order_type == "MARKET"
+        assert executor.plans[0].order_type == "LIMIT"
+        assert executor.plans[0].limit_price == 48.98
         assert executor.plans[0].trigger_price is None
-        assert service.get("trigger-one").status == "EXECUTED"
+        assert service.get("trigger-one").status == "LIMIT_PLACED"
         assert len(registered) == 1
         assert "Сработал триггер" in messages[0]
 
     asyncio.run(scenario())
+
+
+def test_long_trigger_limit_is_above_reference_price(tmp_path):
+    service, _, _ = make_service(tmp_path, Market(51))
+
+    limit_plan = service._build_limit_plan(
+        make_plan(OrderSide.LONG),
+        51,
+    )
+
+    assert limit_plan.order_type == "LIMIT"
+    assert limit_plan.limit_price == 51.02
+    assert limit_plan.total_quantity < make_plan(
+        OrderSide.LONG
+    ).total_quantity
 
 
 def test_arm_refuses_stale_confirmation_after_crossing(tmp_path):

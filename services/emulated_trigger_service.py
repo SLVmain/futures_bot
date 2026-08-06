@@ -2,12 +2,16 @@ import asyncio
 import json
 import time
 from dataclasses import asdict, dataclass, replace
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from threading import Lock
 from typing import Awaitable, Callable
 
 from models.signal import OrderSide
+from models.signal import TradeSignal
 from models.trade import PlannedTakeProfit, TradePlan
+from config.settings import TradeSettings
+from services.trade_planner import TradePlanner
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,7 @@ class EmulatedTriggerService:
         self,
         market_service,
         execution_service,
+        account_service,
         order_service,
         position_service,
         store: EmulatedTriggerStore,
@@ -106,9 +111,11 @@ class EmulatedTriggerService:
         *,
         poll_interval: float = 3.0,
         max_age_seconds: float = 86400,
+        limit_offset_ticks: int = 2,
     ):
         self.market = market_service
         self.execution = execution_service
+        self.account = account_service
         self.orders = order_service
         self.positions = position_service
         self.store = store
@@ -116,6 +123,7 @@ class EmulatedTriggerService:
         self.register_execution = register_execution
         self.poll_interval = poll_interval
         self.max_age_seconds = max_age_seconds
+        self.limit_offset_ticks = limit_offset_ticks
         self.records = store.load()
         self._task = None
         self._stop = asyncio.Event()
@@ -297,23 +305,26 @@ class EmulatedTriggerService:
                     "но вход заблокирован: уже есть ордер или позиция по символу.",
                 )
                 return
-            market_plan = replace(
+            limit_plan = await asyncio.to_thread(
+                self._build_limit_plan,
                 plan,
-                current_price=price,
-                in_range=True,
-                limit_price=None,
-                trigger_price=None,
+                price,
             )
-            result = await asyncio.to_thread(self.execution.execute, market_plan)
+            result = await asyncio.to_thread(
+                self.execution.execute,
+                limit_plan,
+            )
             if result.orders:
-                await self.register_execution(market_plan, result)
-            status = "EXECUTED" if result.success else (
-                "PARTIAL" if result.orders else "FAILED"
+                await self.register_execution(limit_plan, result)
+            status = "LIMIT_PLACED" if result.success else (
+                "PARTIAL_PLACED" if result.orders else "FAILED"
             )
             text = (
                 f"✅ Сработал триггер {plan.side.value} {plan.symbol}\n"
                 f"Триггер: {plan.trigger_price}; цена Bitunix: {price}\n"
-                f"Статус входа: {status}"
+                f"Отправлен LIMIT: {limit_plan.limit_price} "
+                f"({self.limit_offset_ticks} тик.)\n"
+                f"Статус входа: {status}; ожидает исполнения"
             )
             if result.error:
                 text += f"\nОшибка: {result.error}"
@@ -327,6 +338,59 @@ class EmulatedTriggerService:
                 f"{type(error).__name__}. Повторный вход не выполнялся; "
                 "проверьте Bitunix.",
             )
+
+    def _build_limit_plan(
+        self,
+        plan: TradePlan,
+        reference_price: float,
+    ) -> TradePlan:
+        instrument = self.market.get_trading_pair(plan.symbol)
+        tick = Decimal("1").scaleb(-instrument.quote_precision)
+        offset = tick * Decimal(self.limit_offset_ticks)
+        raw_price = Decimal(str(reference_price))
+        if plan.side is OrderSide.LONG:
+            limit_price = (raw_price + offset).quantize(
+                tick,
+                rounding=ROUND_UP,
+            )
+        else:
+            limit_price = (raw_price - offset).quantize(
+                tick,
+                rounding=ROUND_DOWN,
+            )
+        if limit_price <= 0:
+            raise ValueError(
+                "Рассчитанная LIMIT-цена должна быть положительной"
+            )
+
+        raw_take_profits = tuple(
+            plan.raw_take_profits
+            or tuple(item.price for item in plan.take_profits)
+        )
+        signal = TradeSignal(
+            symbol=plan.symbol,
+            side=plan.side,
+            entry_min=plan.entry_min,
+            entry_max=plan.entry_max,
+            take_profits=list(raw_take_profits),
+            stop_loss=plan.stop_loss,
+        )
+        account = self.account.get_account("USDT")
+        planner = TradePlanner(
+            self.market,
+            TradeSettings(
+                leverage=plan.leverage,
+                risk_percent=plan.risk_percent,
+                max_tp_count=len(plan.take_profits),
+                enable_emulated_triggers=False,
+            ),
+        )
+        replanned = planner.create_plan(
+            signal,
+            account,
+            limit_price_override=float(limit_price),
+        )
+        return replace(replanned, execution_id=plan.execution_id)
 
     async def _finish(
         self, record: EmulatedTrigger, status: str,

@@ -144,6 +144,7 @@ class TradePlanner:
         account: AccountBalance,
         *,
         force_market: bool = False,
+        limit_price_override: float | None = None,
     ) -> TradePlan:
         ticker = self.market.get_ticker(signal.symbol)
         if not ticker:
@@ -173,7 +174,26 @@ class TradePlanner:
         trigger_price = None
         market_price = Decimal(str(current_price))
         planned_entry = market_price
-        if not in_range and not force_market:
+        if limit_price_override is not None:
+            if force_market:
+                raise TradePlanningError(
+                    "Нельзя одновременно задать MARKET и LIMIT-вход"
+                )
+            override_rounding = (
+                ROUND_UP
+                if signal.side is OrderSide.LONG
+                else ROUND_DOWN
+            )
+            planned_entry = Decimal(
+                str(limit_price_override)
+            ).quantize(price_step, rounding=override_rounding)
+            if planned_entry <= 0:
+                raise TradePlanningError(
+                    "Цена лимитного входа должна быть положительной"
+                )
+            limit_price = float(planned_entry)
+            in_range = False
+        elif not in_range and not force_market:
             planned_entry = (
                 (
                     Decimal(str(entry_min))

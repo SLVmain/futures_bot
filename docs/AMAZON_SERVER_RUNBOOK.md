@@ -301,11 +301,13 @@ TRADING_MODE=dry-run
 ENABLE_PRIVATE_WEBSOCKET=false
 AUTO_MOVE_STOP_LOSS_ON_TP1=true
 ENABLE_EMULATED_ENTRY_TRIGGERS=true
+TRIGGER_LIMIT_OFFSET_TICKS=2
 ```
 
 Обе автоматические функции явно включены: после подтверждённого исполнения
 TP1 бот переносит SL в безубыток, а локальные триггерные планы могут отправить
-MARKET-вход при достижении цены. В `dry-run` реальные ордера не создаются.
+LIMIT-вход со смещением при достижении цены. В `dry-run` реальные ордера не
+создаются.
 
 Перед включением `live` отдельно проверьте настройки риска, ключи API,
 доступ к Telegram и результаты работы в `dry-run`.

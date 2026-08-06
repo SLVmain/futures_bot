@@ -9,6 +9,7 @@ class TriggerConfig:
     state_path: Path
     poll_interval: float
     max_age_seconds: float
+    limit_offset_ticks: int
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> "TriggerConfig":
@@ -24,15 +25,21 @@ class TriggerConfig:
             max_age_minutes = float(
                 environ.get("TRIGGER_MAX_AGE_MINUTES", "1440")
             )
+            limit_offset_ticks = int(
+                environ.get("TRIGGER_LIMIT_OFFSET_TICKS", "2")
+            )
         except ValueError as error:
             raise ValueError(
-                "TRIGGER_POLL_SECONDS and TRIGGER_MAX_AGE_MINUTES "
-                "must be numbers"
+                "Trigger intervals and offset must be numbers"
             ) from error
         if poll_interval < 1:
             raise ValueError("TRIGGER_POLL_SECONDS must be at least 1")
         if max_age_minutes <= 0:
             raise ValueError("TRIGGER_MAX_AGE_MINUTES must be positive")
+        if limit_offset_ticks < 1:
+            raise ValueError(
+                "TRIGGER_LIMIT_OFFSET_TICKS must be at least 1"
+            )
         return cls(
             enabled=raw_enabled == "true",
             state_path=Path(environ.get(
@@ -40,4 +47,5 @@ class TriggerConfig:
             )),
             poll_interval=poll_interval,
             max_age_seconds=max_age_minutes * 60,
+            limit_offset_ticks=limit_offset_ticks,
         )

@@ -380,7 +380,7 @@ def test_creates_emulated_trigger_when_limit_would_execute_immediately(
         AccountBalance("USDT", "1000"),
     )
 
-    assert plan.order_type == "TRIGGER_MARKET"
+    assert plan.order_type == "TRIGGER_LIMIT"
     assert plan.trigger_price == 50
     assert plan.limit_price is None
     assert plan.in_range is False

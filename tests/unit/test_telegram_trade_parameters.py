@@ -292,7 +292,7 @@ def test_api_unsupported_plan_is_shown_without_entry_button(
 
         assert progress.deleted is True
         assert "РУЧНОЕ РАЗМЕЩЕНИЕ" in message.replies[0][0]
-        assert "Тип ордера: TRIGGER\\_MARKET" in (
+        assert "Тип ордера: TRIGGER\\_LIMIT" in (
             message.replies[0][0]
         )
         assert "Кнопка автоматического входа отключена" in (
