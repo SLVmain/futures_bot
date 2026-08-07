@@ -268,6 +268,7 @@ class CsvTradeJournal:
         position_id: str,
         client_id: str,
         tp_number: int,
+        take_profit: str = "",
     ) -> None:
         self.append(JournalEvent(
             event_type="tp_order",
@@ -275,8 +276,24 @@ class CsvTradeJournal:
             client_id=client_id,
             order_id=order_id,
             position_id=position_id,
+            take_profit=take_profit,
             source_event_id=f"tp-order:{order_id}",
         ))
+
+    def load_tp_order_prices(self) -> dict[str, Decimal]:
+        if not self.path.exists():
+            return {}
+        prices = {}
+        for row in self._read_rows():
+            if row.get("event_type") != "tp_order":
+                continue
+            try:
+                price = Decimal(row.get("take_profit", ""))
+            except InvalidOperation:
+                continue
+            if row.get("order_id") and price > 0:
+                prices[row["order_id"]] = price
+        return prices
 
     def load_active_tp1_orders(self) -> dict[str, str]:
         return {

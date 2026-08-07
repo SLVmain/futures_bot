@@ -74,6 +74,7 @@ class PositionMonitor:
         self._tp_order_client_ids = (
             journal.load_active_tp_order_client_ids()
         )
+        self._tp_order_prices = journal.load_tp_order_prices()
         self._tp1_order_positions = {
             order_id: position_id
             for order_id, (position_id, tp_number)
@@ -226,7 +227,7 @@ class PositionMonitor:
                         client_id,
                     )
         if channel == "tpsl" and status == "FILLED":
-            await self._request_break_even(data)
+            await self._handle_take_profit_stop_move(data)
 
     async def _verify_attached_protections(self, data: dict) -> None:
         client_id = str(data.get("clientId", ""))
@@ -346,8 +347,10 @@ class PositionMonitor:
                     position.position_id,
                     client_id,
                     index,
+                    str(price),
                 )
                 self._tp_order_client_ids[tp_order_id] = client_id
+                self._tp_order_prices[tp_order_id] = price
                 if index == 1:
                     self._tp1_order_positions[tp_order_id] = (
                         position.position_id
@@ -618,6 +621,154 @@ class PositionMonitor:
             + "\n\nПеренести SL всех оставшихся частей "
             "в их fee-aware безубыток?",
             proposal.proposal_id,
+        )
+
+    async def _handle_take_profit_stop_move(self, data: dict) -> None:
+        order_id = str(data.get("orderId", ""))
+        tracked = self._tp_orders.get(order_id)
+        if tracked is None:
+            if order_id in self._tp1_order_positions:
+                await self._request_break_even(data)
+            return
+        _, tp_number = tracked
+        if tp_number == 1:
+            await self._request_break_even(data)
+            return
+        if not self.auto_move_stop_loss_on_tp1:
+            return
+        try:
+            await self._move_stop_to_previous_take_profit(
+                data,
+                tp_number,
+            )
+        except Exception as error:
+            await self.notifier(
+                f"⚠️ TP{tp_number} исполнен, но автоматический "
+                "перенос SL не выполнен: "
+                f"{type(error).__name__}. "
+                "Проверьте оставшиеся позиции и SL на Bitunix."
+            )
+
+    async def _move_stop_to_previous_take_profit(
+        self,
+        data: dict,
+        tp_number: int,
+    ) -> None:
+        order_id = str(data.get("orderId", ""))
+        client_id = self._tp_order_client_ids.get(order_id, "")
+        execution_prefix = self._execution_client_prefix(client_id)
+        if not execution_prefix:
+            raise ValueError("Не найдена группа сигнала")
+        previous_order_id = next(
+            (
+                tracked_order_id
+                for tracked_order_id, (_, tracked_tp_number)
+                in self._tp_orders.items()
+                if tracked_tp_number == tp_number - 1
+                and self._execution_client_prefix(
+                    self._tp_order_client_ids.get(
+                        tracked_order_id,
+                        "",
+                    )
+                ) == execution_prefix
+            ),
+            None,
+        )
+        target_stop = self._tp_order_prices.get(previous_order_id or "")
+        if target_stop is None:
+            raise ValueError("Не найдена цена предыдущего тейка")
+        remaining_position_ids = {
+            position_id
+            for tracked_order_id, (position_id, tracked_tp_number)
+            in self._tp_orders.items()
+            if tracked_tp_number > tp_number
+            and self._execution_client_prefix(
+                self._tp_order_client_ids.get(tracked_order_id, "")
+            ) == execution_prefix
+        }
+        if not remaining_position_ids:
+            return
+        open_positions = await asyncio.to_thread(
+            self.positions.get_open_positions,
+            str(data.get("symbol", "")) or None,
+        )
+        positions = tuple(
+            position
+            for position in open_positions
+            if position.position_id in remaining_position_ids
+        )
+        if not positions:
+            return
+        changes = []
+        protected_positions = set()
+        for position in positions:
+            protections = await asyncio.to_thread(
+                self.protections.get_pending_tp_sl,
+                position.symbol,
+                position.position_id,
+            )
+            stop_orders = [
+                item
+                for item in protections
+                if (
+                    str(item.get("positionId", ""))
+                    == position.position_id
+                    and item.get("slPrice")
+                    and item.get("id")
+                )
+            ]
+            if not stop_orders:
+                raise ValueError(
+                    "Активный SL не найден для позиции "
+                    f"{position.position_id}"
+                )
+            for stop_order in stop_orders:
+                current_stop = Decimal(str(stop_order["slPrice"]))
+                already_better = (
+                    position.side == "LONG"
+                    and current_stop >= target_stop
+                ) or (
+                    position.side == "SHORT"
+                    and current_stop <= target_stop
+                )
+                if already_better:
+                    protected_positions.add(position.position_id)
+                    continue
+                stop_quantity = (
+                    stop_order.get("slQty") or stop_order.get("qty")
+                )
+                if not stop_quantity:
+                    if len(stop_orders) == 1:
+                        stop_quantity = position.quantity
+                    else:
+                        raise ValueError(
+                            "Bitunix не вернул объём частичного SL"
+                        )
+                changes.append((position, stop_order, stop_quantity))
+        for position, stop_order, stop_quantity in changes:
+            await asyncio.to_thread(
+                self.protections.modify_stop_loss,
+                str(stop_order["id"]),
+                str(target_stop),
+                stop_quantity,
+            )
+            protected_positions.add(position.position_id)
+        await asyncio.to_thread(
+            self.journal.append,
+            JournalEvent(
+                event_type="trailing_stop",
+                status="COMPLETED",
+                symbol=positions[0].symbol,
+                position_id=",".join(sorted(protected_positions)),
+                stop_loss=str(target_stop),
+                source_event_id=f"trailing-stop:{order_id}",
+            ),
+        )
+        await self.notifier(
+            f"🎯 TP{tp_number} исполнен\n\n"
+            f"✅ SL оставшихся частей перенесён на TP{tp_number - 1}: "
+            f"{target_stop}\n"
+            f"Позиций защищено: {len(protected_positions)}"
         )
 
     async def confirm_break_even(

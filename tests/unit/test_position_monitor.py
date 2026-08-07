@@ -1,6 +1,7 @@
 import asyncio
 import csv
 from dataclasses import replace
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -1127,5 +1128,118 @@ def test_break_even_groups_only_remaining_positions_of_same_signal(
         assert "position-2" in result
         assert "position-3" in result
         assert "position-other" not in result
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("filled_order", "remaining_position", "target", "label"),
+    [
+        ("tp-2", "position-3", "55", "TP1"),
+        ("tp-3", "position-4", "60", "TP2"),
+    ],
+)
+def test_later_tp_moves_remaining_stops_to_previous_tp(
+    tmp_path,
+    run_blocking_calls_inline,
+    filled_order,
+    remaining_position,
+    target,
+    label,
+):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(
+            tmp_path,
+            notifications,
+            auto_move_stop_loss_on_tp1=True,
+        )
+        position = replace(
+            make_position(),
+            position_id=remaining_position,
+            quantity="0.2",
+        )
+        monitor.positions.get_open_positions = lambda *args: (position,)
+        monitor._tp_orders = {
+            "tp-1": ("position-1", 1),
+            "tp-2": ("position-2", 2),
+            "tp-3": ("position-3", 3),
+            "tp-4": ("position-4", 4),
+        }
+        monitor._tp_order_client_ids = {
+            "tp-1": "bot-signal-a-1",
+            "tp-2": "bot-signal-a-2",
+            "tp-3": "bot-signal-a-3",
+            "tp-4": "bot-signal-a-4",
+        }
+        monitor._tp_order_prices = {
+            "tp-1": Decimal("55"),
+            "tp-2": Decimal("60"),
+            "tp-3": Decimal("65"),
+            "tp-4": Decimal("70"),
+        }
+        monitor.protections.pending = [{
+            "id": "sl-3",
+            "positionId": remaining_position,
+            "slPrice": "50.03",
+            "slQty": "0.2",
+        }]
+
+        await monitor._handle_take_profit_stop_move({
+            "orderId": filled_order,
+            "symbol": "BTCUSDT",
+        })
+
+        assert monitor.protections.modified == [
+            ("sl-3", target, "0.2")
+        ]
+        assert f"SL оставшихся частей перенесён на {label}: {target}" in (
+            notifications[-1]
+        )
+
+    asyncio.run(scenario())
+
+
+def test_later_take_profit_never_moves_stop_backwards(
+    tmp_path,
+    run_blocking_calls_inline,
+):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(
+            tmp_path,
+            notifications,
+            auto_move_stop_loss_on_tp1=True,
+        )
+        position = replace(
+            make_position(),
+            position_id="position-3",
+        )
+        monitor.positions.get_open_positions = lambda *args: (position,)
+        monitor._tp_orders = {
+            "tp-1": ("position-1", 1),
+            "tp-2": ("position-2", 2),
+            "tp-3": ("position-3", 3),
+        }
+        monitor._tp_order_client_ids = {
+            "tp-1": "bot-signal-a-1",
+            "tp-2": "bot-signal-a-2",
+            "tp-3": "bot-signal-a-3",
+        }
+        monitor._tp_order_prices = {"tp-1": Decimal("55")}
+        monitor.protections.pending = [{
+            "id": "sl-3",
+            "positionId": "position-3",
+            "slPrice": "56",
+            "slQty": "1",
+        }]
+
+        await monitor._handle_take_profit_stop_move({
+            "orderId": "tp-2",
+            "symbol": "BTCUSDT",
+        })
+
+        assert monitor.protections.modified == []
+        assert "Позиций защищено: 1" in notifications[-1]
 
     asyncio.run(scenario())

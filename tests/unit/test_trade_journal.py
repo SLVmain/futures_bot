@@ -75,8 +75,8 @@ def test_pending_take_profit_plan_survives_restart(tmp_path):
 
 def test_journal_restores_all_take_profit_numbers(tmp_path):
     journal = CsvTradeJournal(tmp_path / "journal.csv")
-    journal.save_tp_order("tp-1", "position-1", "client-1", 1)
-    journal.save_tp_order("tp-2", "position-1", "client-1", 2)
+    journal.save_tp_order("tp-1", "position-1", "client-1", 1, "55")
+    journal.save_tp_order("tp-2", "position-1", "client-1", 2, "60")
 
     assert journal.load_active_tp_orders() == {
         "tp-1": ("position-1", 1),
@@ -88,6 +88,10 @@ def test_journal_restores_all_take_profit_numbers(tmp_path):
     assert journal.load_active_tp_order_client_ids() == {
         "tp-1": "client-1",
         "tp-2": "client-1",
+    }
+    assert journal.load_tp_order_prices() == {
+        "tp-1": Decimal("55"),
+        "tp-2": Decimal("60"),
     }
 
 

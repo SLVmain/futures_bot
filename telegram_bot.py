@@ -1531,7 +1531,10 @@ class FuturesBot:
             if self.monitoring.auto_move_stop_loss_on_tp1
             else "с подтверждением"
         )
-        text += f"\nSL после TP1: {break_even_mode}"
+        text += (
+            f"\nSL после тейков: {break_even_mode} "
+            "(TP1 → безубыток, далее → предыдущий TP)"
+        )
         await update.message.reply_text(text)
 
     async def positions(
