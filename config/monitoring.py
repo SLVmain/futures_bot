@@ -13,6 +13,7 @@ class MonitoringConfig:
     journal_path: Path
     taker_fee_rate: Decimal
     auto_move_stop_loss_on_tp1: bool
+    auto_restore_canceled_stop_loss: bool
 
     @classmethod
     def from_env(
@@ -82,10 +83,19 @@ class MonitoringConfig:
             raise ValueError(
                 "AUTO_MOVE_STOP_LOSS_ON_TP1 must be true or false"
             )
+        raw_auto_restore_stop_loss = environ.get(
+            "AUTO_RESTORE_CANCELED_STOP_LOSS",
+            "true",
+        ).strip().lower()
+        if raw_auto_restore_stop_loss not in {"true", "false"}:
+            raise ValueError(
+                "AUTO_RESTORE_CANCELED_STOP_LOSS must be true or false"
+            )
         return cls(
             enabled,
             websocket_url,
             path,
             taker_fee_rate,
             raw_auto_move_stop_loss == "true",
+            raw_auto_restore_stop_loss == "true",
         )

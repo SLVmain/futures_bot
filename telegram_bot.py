@@ -211,6 +211,9 @@ class FuturesBot:
                 auto_move_stop_loss_on_tp1=(
                     self.monitoring.auto_move_stop_loss_on_tp1
                 ),
+                auto_restore_canceled_stop_loss=(
+                    self.monitoring.auto_restore_canceled_stop_loss
+                ),
             )
             self.websocket = BitunixPrivateWebSocket(
                 api_key,
@@ -1535,6 +1538,12 @@ class FuturesBot:
             f"\nSL после тейков: {break_even_mode} "
             "(TP1 → безубыток, далее → предыдущий TP)"
         )
+        restore_mode = (
+            "включено"
+            if self.monitoring.auto_restore_canceled_stop_loss
+            else "отключено"
+        )
+        text += f"\nВосстановление отменённого SL: {restore_mode}"
         await update.message.reply_text(text)
 
     async def positions(

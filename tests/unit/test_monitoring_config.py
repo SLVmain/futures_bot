@@ -15,6 +15,7 @@ def test_dry_run_always_disables_private_websocket():
     assert config.enabled is False
     assert config.websocket_url is None
     assert config.auto_move_stop_loss_on_tp1 is True
+    assert config.auto_restore_canceled_stop_loss is True
 
 
 def test_live_monitoring_uses_official_private_url():
@@ -27,6 +28,7 @@ def test_live_monitoring_uses_official_private_url():
     assert config.websocket_url == "wss://fapi.bitunix.com/private/"
     assert config.journal_path == Path("data/trade_journal.csv")
     assert config.auto_move_stop_loss_on_tp1 is True
+    assert config.auto_restore_canceled_stop_loss is True
 
 
 def test_auto_break_even_can_be_disabled():
@@ -45,6 +47,23 @@ def test_auto_break_even_rejects_unknown_value():
     with pytest.raises(ValueError, match="AUTO_MOVE_STOP_LOSS_ON_TP1"):
         MonitoringConfig.from_env(
             {"AUTO_MOVE_STOP_LOSS_ON_TP1": "yes"},
+            ExecutionMode.DRY_RUN,
+        )
+
+
+def test_auto_stop_restore_can_be_disabled():
+    config = MonitoringConfig.from_env(
+        {"AUTO_RESTORE_CANCELED_STOP_LOSS": "false"},
+        ExecutionMode.DRY_RUN,
+    )
+
+    assert config.auto_restore_canceled_stop_loss is False
+
+
+def test_auto_stop_restore_rejects_unknown_value():
+    with pytest.raises(ValueError, match="AUTO_RESTORE_CANCELED_STOP_LOSS"):
+        MonitoringConfig.from_env(
+            {"AUTO_RESTORE_CANCELED_STOP_LOSS": "yes"},
             ExecutionMode.DRY_RUN,
         )
 

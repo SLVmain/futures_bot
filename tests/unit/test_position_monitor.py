@@ -51,6 +51,7 @@ class FakeProtections:
     def __init__(self):
         self.placed = []
         self.modified = []
+        self.stop_losses = []
         self.pending = [{
             "id": "tp-existing",
             "positionId": "position-1",
@@ -85,6 +86,10 @@ class FakeProtections:
     ):
         self.modified.append((order_id, price, quantity))
         return order_id
+
+    def place_stop_loss(self, symbol, position_id, price, quantity):
+        self.stop_losses.append((symbol, position_id, price, quantity))
+        return "sl-restored"
 
 
 def make_monitor(tmp_path, notifications, **kwargs):
@@ -1241,5 +1246,116 @@ def test_later_take_profit_never_moves_stop_backwards(
 
         assert monitor.protections.modified == []
         assert "Позиций защищено: 1" in notifications[-1]
+
+    asyncio.run(scenario())
+
+
+def test_canceled_stop_is_restored_for_tracked_open_position(
+    tmp_path,
+    run_blocking_calls_inline,
+):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(
+            tmp_path,
+            notifications,
+            canceled_stop_restore_delay=0,
+        )
+        monitor._tp_orders = {
+            "tp-1": ("position-1", 1),
+        }
+        monitor.protections.pending = []
+        data = {
+            "orderId": "sl-old",
+            "positionId": "position-1",
+            "symbol": "BTCUSDT",
+            "slPrice": "45",
+        }
+
+        monitor._schedule_canceled_stop_restore(data)
+        task = monitor._stop_restore_tasks["sl-old"]
+        await task
+
+        assert monitor.protections.stop_losses == [
+            ("BTCUSDT", "position-1", "45", "1")
+        ]
+        assert "Отменённый SL восстановлен автоматически" in (
+            notifications[-1]
+        )
+
+    asyncio.run(scenario())
+
+
+def test_canceled_stop_is_not_duplicated_during_replacement(
+    tmp_path,
+    run_blocking_calls_inline,
+):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(
+            tmp_path,
+            notifications,
+            canceled_stop_restore_delay=0,
+        )
+        monitor._tp_orders = {
+            "tp-1": ("position-1", 1),
+        }
+        monitor.protections.pending = [{
+            "id": "sl-new",
+            "positionId": "position-1",
+            "slPrice": "46",
+            "slQty": "1",
+        }]
+
+        monitor._schedule_canceled_stop_restore({
+            "orderId": "sl-old",
+            "positionId": "position-1",
+            "symbol": "BTCUSDT",
+            "slPrice": "45",
+        })
+        task = monitor._stop_restore_tasks["sl-old"]
+        await task
+
+        assert monitor.protections.stop_losses == []
+        assert "позиция уже защищена новым SL" in notifications[-1]
+
+    asyncio.run(scenario())
+
+
+def test_canceled_stop_of_untracked_position_is_not_restored(
+    tmp_path,
+):
+    monitor = make_monitor(tmp_path, [])
+
+    monitor._schedule_canceled_stop_restore({
+        "orderId": "sl-other",
+        "positionId": "position-other",
+        "symbol": "BTCUSDT",
+        "slPrice": "45",
+    })
+
+    assert monitor._stop_restore_tasks == {}
+    assert monitor.protections.stop_losses == []
+
+
+def test_canceled_stop_notification_identifies_stop_and_price(tmp_path):
+    async def scenario():
+        monitor = make_monitor(tmp_path, [])
+
+        message = await monitor._notification(
+            "tpsl",
+            {
+                "orderId": "sl-old",
+                "positionId": "position-1",
+                "symbol": "BTCUSDT",
+                "slPrice": "45",
+            },
+            "CANCELED",
+        )
+
+        assert message == (
+            "⚠️ Защитный SL отменён: BTCUSDT, SL 45, "
+            "позиция position-1, ордер sl-old"
+        )
 
     asyncio.run(scenario())

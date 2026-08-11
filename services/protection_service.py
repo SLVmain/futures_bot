@@ -58,6 +58,34 @@ class ProtectionService:
             )
         return order_id
 
+    def place_stop_loss(
+        self,
+        symbol: str,
+        position_id: str,
+        price: str,
+        quantity: str,
+    ) -> str:
+        response = self.client.post(
+            "/api/v1/futures/tpsl/place_order",
+            "",
+            {
+                "symbol": symbol,
+                "positionId": position_id,
+                "slPrice": str(price),
+                "slStopType": "LAST_PRICE",
+                "slOrderType": "MARKET",
+                "slQty": str(quantity),
+            },
+        )
+        data = response.get("data")
+        order_id = self._extract_order_id(data)
+        if order_id is None:
+            raise BitunixResponseError(
+                "SL order identity is missing; "
+                f"{self._response_shape(data)}"
+            )
+        return order_id
+
     def modify_stop_loss(
         self,
         order_id: str,

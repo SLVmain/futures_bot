@@ -55,6 +55,8 @@ class PositionMonitor:
             4,
         ),
         auto_move_stop_loss_on_tp1: bool = False,
+        auto_restore_canceled_stop_loss: bool = True,
+        canceled_stop_restore_delay: float = 3,
     ):
         self.orders = orders
         self.positions = positions
@@ -65,6 +67,10 @@ class PositionMonitor:
         self.taker_fee_rate = taker_fee_rate
         self.position_retry_delays = position_retry_delays
         self.auto_move_stop_loss_on_tp1 = auto_move_stop_loss_on_tp1
+        self.auto_restore_canceled_stop_loss = (
+            auto_restore_canceled_stop_loss
+        )
+        self.canceled_stop_restore_delay = canceled_stop_restore_delay
         self._plans_by_client_id = journal.load_pending_plans()
         self._tp_numbers_by_client_id = {
             client_id: self._tp_number_from_client_id(client_id)
@@ -85,6 +91,7 @@ class PositionMonitor:
         self._pending_plan_notifications: set[str] = set()
         self._entry_fill_groups: dict[str, EntryFillGroup] = {}
         self._recent_bot_open_symbols: dict[str, float] = {}
+        self._stop_restore_tasks: dict[str, asyncio.Task] = {}
         for client_id, plan in self._plans_by_client_id.items():
             self._register_entry_notification(client_id, plan.symbol)
 
@@ -228,6 +235,8 @@ class PositionMonitor:
                     )
         if channel == "tpsl" and status == "FILLED":
             await self._handle_take_profit_stop_move(data)
+        if channel == "tpsl" and status == "CANCELED":
+            self._schedule_canceled_stop_restore(data)
 
     async def _verify_attached_protections(self, data: dict) -> None:
         client_id = str(data.get("clientId", ""))
@@ -648,6 +657,116 @@ class PositionMonitor:
                 f"{type(error).__name__}. "
                 "Проверьте оставшиеся позиции и SL на Bitunix."
             )
+
+    def _schedule_canceled_stop_restore(self, data: dict) -> None:
+        if not self.auto_restore_canceled_stop_loss:
+            return
+        order_id = str(data.get("orderId", ""))
+        position_id = str(data.get("positionId", ""))
+        stop_price = str(data.get("slPrice", ""))
+        if not order_id or not position_id or not stop_price:
+            return
+        tracked_position_ids = {
+            tracked_position_id
+            for tracked_position_id, _ in self._tp_orders.values()
+        }
+        if position_id not in tracked_position_ids:
+            return
+        existing = self._stop_restore_tasks.get(order_id)
+        if existing is not None and not existing.done():
+            return
+        snapshot = dict(data)
+        self._stop_restore_tasks[order_id] = asyncio.create_task(
+            self._restore_canceled_stop_loss(snapshot),
+            name=f"restore-stop-loss-{order_id}",
+        )
+
+    async def _restore_canceled_stop_loss(self, data: dict) -> None:
+        order_id = str(data.get("orderId", ""))
+        position_id = str(data.get("positionId", ""))
+        symbol = str(data.get("symbol", ""))
+        stop_price = str(data.get("slPrice", ""))
+        try:
+            if self.canceled_stop_restore_delay:
+                await asyncio.sleep(self.canceled_stop_restore_delay)
+            try:
+                normalized_stop = Decimal(stop_price)
+            except InvalidOperation as error:
+                raise ValueError("Некорректная цена отменённого SL") from error
+            if normalized_stop <= 0:
+                raise ValueError("Цена отменённого SL должна быть положительной")
+            open_positions = await asyncio.to_thread(
+                self.positions.get_open_positions,
+                symbol or None,
+            )
+            position = next(
+                (
+                    item for item in open_positions
+                    if item.position_id == position_id
+                ),
+                None,
+            )
+            if position is None:
+                return
+            protections = await asyncio.to_thread(
+                self.protections.get_pending_tp_sl,
+                position.symbol,
+                position.position_id,
+            )
+            active_stops = [
+                item
+                for item in protections
+                if (
+                    str(item.get("positionId", "")) == position_id
+                    and item.get("slPrice")
+                )
+            ]
+            if active_stops:
+                await self.notifier(
+                    "ℹ️ Старый SL отменён при замене, но позиция уже "
+                    f"защищена новым SL: {position.symbol}, "
+                    f"позиция {position_id}. Восстановление не требуется."
+                )
+                return
+            new_order_id = await asyncio.to_thread(
+                self.protections.place_stop_loss,
+                position.symbol,
+                position.position_id,
+                stop_price,
+                position.quantity,
+            )
+            await asyncio.to_thread(
+                self.journal.append,
+                JournalEvent(
+                    event_type="stop_loss_restore",
+                    status="COMPLETED",
+                    symbol=position.symbol,
+                    quantity=str(position.quantity),
+                    stop_loss=stop_price,
+                    order_id=new_order_id,
+                    position_id=position.position_id,
+                    source_event_id=f"restore-stop:{order_id}",
+                ),
+            )
+            await self.notifier(
+                "🛡️ Отменённый SL восстановлен автоматически\n\n"
+                f"{position.side} {position.symbol}\n"
+                f"SL: {stop_price}\n"
+                f"Объём: {position.quantity}\n"
+                f"Позиция: {position.position_id}\n"
+                f"Новый ID: {new_order_id}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self.notifier(
+                "🚨 SL был отменён и автоматически восстановить его "
+                f"не удалось: {type(error).__name__}. "
+                f"{symbol}, позиция {position_id}. "
+                "Проверьте защиту на Bitunix немедленно."
+            )
+        finally:
+            self._stop_restore_tasks.pop(order_id, None)
 
     async def _move_stop_to_previous_take_profit(
         self,
@@ -1119,9 +1238,27 @@ class PositionMonitor:
                     f"ID: {order_id}"
                 )
             if status == "CANCELED":
+                order_id = str(data.get("orderId", ""))
+                if data.get("slPrice") and data.get("tpPrice"):
+                    protection_kind = "TP/SL"
+                    price_text = (
+                        f"TP {data.get('tpPrice')}, "
+                        f"SL {data.get('slPrice')}"
+                    )
+                elif data.get("slPrice"):
+                    protection_kind = "SL"
+                    price_text = f"SL {data.get('slPrice')}"
+                elif data.get("tpPrice"):
+                    protection_kind = "TP"
+                    price_text = f"TP {data.get('tpPrice')}"
+                else:
+                    protection_kind = "TP/SL"
+                    price_text = "цена неизвестна"
                 return (
-                    f"⚠️ Защитный TP/SL отменён: {symbol}, "
-                    f"позиция {data.get('positionId', '')}"
+                    f"⚠️ Защитный {protection_kind} отменён: "
+                    f"{symbol}, {price_text}, "
+                    f"позиция {data.get('positionId', '')}, "
+                    f"ордер {order_id}"
                 )
         return None
 

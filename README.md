@@ -108,6 +108,7 @@ TRADE_JOURNAL_PATH=data/trade_journal.csv
 FUTURES_TAKER_FEE_RATE=0.0006
 TAKE_PROFIT_OFFSET_TICKS=2
 AUTO_MOVE_STOP_LOSS_ON_TP1=true
+AUTO_RESTORE_CANCELED_STOP_LOSS=true
 ENABLE_EMULATED_ENTRY_TRIGGERS=true
 TRIGGER_POLL_SECONDS=3
 TRIGGER_MAX_AGE_MINUTES=1440
@@ -135,6 +136,7 @@ TRIGGER_STATE_PATH=data/emulated_triggers.json
 | `FUTURES_TAKER_FEE_RATE` | Комиссия taker в десятичном виде |
 | `TAKE_PROFIT_OFFSET_TICKS` | Сдвиг каждого TP ближе к входу; `0` отключает сдвиг, по умолчанию `2` тика |
 | `AUTO_MOVE_STOP_LOSS_ON_TP1` | Ступенчато перемещать SL: TP1 → fee-aware безубыток, далее → предыдущий TP; `true` или `false` |
+| `AUTO_RESTORE_CANCELED_STOP_LOSS` | После отмены SL повторно проверить позицию и восстановить отменённую цену, только если другого SL нет; по умолчанию `true` |
 | `ENABLE_EMULATED_ENTRY_TRIGGERS` | Локальные условные входы для случаев, когда обычный LIMIT исполнился бы сразу |
 | `TRIGGER_POLL_SECONDS` | Интервал проверки цены активных локальных триггеров, минимум 1 секунда |
 | `TRIGGER_MAX_AGE_MINUTES` | Максимальный срок жизни локального триггера |
@@ -246,6 +248,14 @@ TP1 через приватный WebSocket автоматически пере�
 частей переносится на цену предыдущего тейка. Значение `false` сохраняет
 подтверждение безубытка после TP1 через кнопку Telegram и отключает дальнейшие
 автоматические ступени. По умолчанию автоматический перенос включён.
+
+При `AUTO_RESTORE_CANCELED_STOP_LOSS=true` событие отмены SL не приводит к
+немедленному повторному ордеру. Бот ждёт 3 секунды и заново проверяет точную
+позицию на Bitunix. Если позиция уже закрыта или новый SL появился во время
+штатной замены, бот ничего не создаёт. Если позиция этого бота открыта и SL
+действительно отсутствует, отменённая цена восстанавливается на весь текущий
+остаток. При ошибке повторная попытка не выполняется, а в Telegram отправляется
+срочное предупреждение для ручной проверки.
 
 ## Первый запуск
 

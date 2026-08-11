@@ -19,6 +19,10 @@ class FakeClient:
             }
         ]}
 
+    def post(self, endpoint, query, body):
+        self.call = (endpoint, query, body)
+        return {"code": 0, "data": {"orderId": "sl-new"}}
+
 
 def make_position():
     return OpenPosition(
@@ -50,6 +54,32 @@ def test_detects_missing_stop_loss():
     assert result[0][1] == ("SL",)
     assert client.call[0] == (
         "/api/v1/futures/tpsl/get_pending_orders"
+    )
+
+
+def test_places_position_stop_loss_with_last_price_trigger():
+    client = FakeClient()
+    service = ProtectionService(client)
+
+    order_id = service.place_stop_loss(
+        "BTCUSDT",
+        "position-1",
+        "45",
+        "1",
+    )
+
+    assert order_id == "sl-new"
+    assert client.call == (
+        "/api/v1/futures/tpsl/place_order",
+        "",
+        {
+            "symbol": "BTCUSDT",
+            "positionId": "position-1",
+            "slPrice": "45",
+            "slStopType": "LAST_PRICE",
+            "slOrderType": "MARKET",
+            "slQty": "1",
+        },
     )
 
 
