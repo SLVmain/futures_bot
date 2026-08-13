@@ -8,6 +8,8 @@ class TradeSettings:
     max_tp_count: int = 5       # Сколько тейков использовать (из сигнала)
     tp_offset_ticks: int = 2    # Сдвиг TP к входу в шагах цены
     enable_emulated_triggers: bool = True
+    max_stop_roi_percent: float | None = None
+    taker_fee_rate: float = 0.0006
     
     # Распределение позиции по тейкам
     tp1_share: float = 0.5      # 50% на первый тейк

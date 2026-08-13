@@ -446,7 +446,11 @@ class EmulatedTriggerService:
             entry_min=plan.entry_min,
             entry_max=plan.entry_max,
             take_profits=list(raw_take_profits),
-            stop_loss=plan.stop_loss,
+            stop_loss=(
+                plan.signal_stop_loss
+                if plan.signal_stop_loss is not None
+                else plan.stop_loss
+            ),
         )
         account = self.account.get_account("USDT")
         planner = TradePlanner(
@@ -457,6 +461,8 @@ class EmulatedTriggerService:
                 max_tp_count=len(plan.take_profits),
                 tp_offset_ticks=self.take_profit_offset_ticks,
                 enable_emulated_triggers=False,
+                max_stop_roi_percent=plan.max_stop_roi_percent,
+                taker_fee_rate=plan.taker_fee_rate,
             ),
         )
         replanned = planner.create_plan(

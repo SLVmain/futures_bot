@@ -12,6 +12,7 @@ from telegram_bot import (
     SIGNAL_KEY,
     WAITING_LEVERAGE,
     WAITING_RISK,
+    WAITING_STOP_LOSS,
     WAITING_TP_STRATEGY,
     FuturesBot,
 )
@@ -169,22 +170,9 @@ def test_three_tp_signal_offers_first_or_all_three():
     ] == ["tp_strategy:3", "tp_strategy:1"]
 
 
-def test_tp_strategy_uses_first_three_targets_before_calculation():
+def test_tp_strategy_selects_targets_then_asks_for_stop_mode():
     async def scenario():
         bot = make_bot()
-        selected = {}
-
-        async def calculate(
-            message,
-            progress_message,
-            context,
-            risk,
-        ):
-            selected["signal"] = context.user_data[SIGNAL_KEY]
-            selected["risk"] = risk
-            return ConversationHandler.END
-
-        bot._calculate_selected_risk = calculate
         query = FakeQuery("tp_strategy:3")
         update = SimpleNamespace(callback_query=query)
         context = SimpleNamespace(user_data={
@@ -198,14 +186,90 @@ def test_tp_strategy_uses_first_three_targets_before_calculation():
             context,
         )
 
-        assert state == ConversationHandler.END
-        assert selected["risk"] == 2.0
-        assert selected["signal"].take_profits == [102, 103, 104]
+        assert state == WAITING_STOP_LOSS
         assert context.user_data[SIGNAL_KEY].take_profits == [
             102,
             103,
             104,
         ]
+        text, kwargs, _ = query.message.replies[-1]
+        assert "Какой стоп-лосс" in text
+        assert [
+            row[0].callback_data
+            for row in kwargs["reply_markup"].inline_keyboard
+        ] == ["stop_loss:signal", "stop_loss:roi5"]
+
+    asyncio.run(scenario())
+
+
+def test_roi_stop_button_passes_five_percent_limit_to_calculation():
+    async def scenario():
+        bot = make_bot()
+        selected = {}
+
+        async def calculate(
+            message,
+            progress_message,
+            context,
+            risk,
+            *,
+            max_stop_roi_percent=None,
+        ):
+            selected["risk"] = risk
+            selected["max_stop_roi_percent"] = max_stop_roi_percent
+            return ConversationHandler.END
+
+        bot._calculate_selected_risk = calculate
+        query = FakeQuery("stop_loss:roi5")
+        update = SimpleNamespace(callback_query=query)
+        context = SimpleNamespace(user_data={
+            SIGNAL_KEY: make_signal(3),
+            LEVERAGE_KEY: 10,
+            RISK_KEY: 1.0,
+        })
+
+        state = await bot.stop_loss_button_handler(update, context)
+
+        assert state == ConversationHandler.END
+        assert selected == {
+            "risk": 1.0,
+            "max_stop_roi_percent": 5.0,
+        }
+        assert "−5% ROI" in query.message.replies[-1][0]
+
+    asyncio.run(scenario())
+
+
+def test_signal_stop_button_keeps_roi_limit_disabled():
+    async def scenario():
+        bot = make_bot()
+        selected = {}
+
+        async def calculate(
+            message,
+            progress_message,
+            context,
+            risk,
+            *,
+            max_stop_roi_percent=None,
+        ):
+            selected["max_stop_roi_percent"] = max_stop_roi_percent
+            return ConversationHandler.END
+
+        bot._calculate_selected_risk = calculate
+        query = FakeQuery("stop_loss:signal")
+        update = SimpleNamespace(callback_query=query)
+        context = SimpleNamespace(user_data={
+            SIGNAL_KEY: make_signal(3),
+            LEVERAGE_KEY: 10,
+            RISK_KEY: 1.0,
+        })
+
+        state = await bot.stop_loss_button_handler(update, context)
+
+        assert state == ConversationHandler.END
+        assert selected["max_stop_roi_percent"] is None
+        assert "SL из сигнала" in query.message.replies[-1][0]
 
     asyncio.run(scenario())
 

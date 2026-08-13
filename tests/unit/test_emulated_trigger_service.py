@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -229,6 +230,24 @@ def test_long_trigger_limit_is_above_reference_price(tmp_path):
     assert limit_plan.total_quantity < make_plan(
         OrderSide.LONG
     ).total_quantity
+
+
+def test_trigger_recalculates_roi_stop_from_actual_limit_price(tmp_path):
+    service, _, _ = make_service(tmp_path, Market(51))
+    trigger_plan = replace(
+        make_plan(OrderSide.LONG),
+        stop_loss=49.81,
+        signal_stop_loss=45,
+        max_stop_roi_percent=5,
+        taker_fee_rate=0.0006,
+    )
+
+    limit_plan = service._build_limit_plan(trigger_plan, 51)
+
+    assert limit_plan.limit_price == 51.02
+    assert limit_plan.signal_stop_loss == 45
+    assert limit_plan.stop_loss > trigger_plan.stop_loss
+    assert limit_plan.estimated_stop_roi_percent <= 5
 
 
 def test_arm_refuses_stale_confirmation_after_crossing(tmp_path):

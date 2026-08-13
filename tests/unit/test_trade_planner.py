@@ -104,6 +104,8 @@ def make_planner(
     risk_percent=1,
     max_tp_count=3,
     instrument=None,
+    max_stop_roi_percent=None,
+    taker_fee_rate=0.0006,
 ):
     return TradePlanner(
         FixedMarket(price, instrument),
@@ -111,6 +113,8 @@ def make_planner(
             leverage=leverage,
             risk_percent=risk_percent,
             max_tp_count=max_tp_count,
+            max_stop_roi_percent=max_stop_roi_percent,
+            taker_fee_rate=taker_fee_rate,
         ),
     )
 
@@ -131,6 +135,68 @@ def test_position_size_uses_distance_to_stop_loss():
     assert tight_stop.estimated_stop_loss == 10
     assert wide_stop.total_quantity == 1
     assert wide_stop.estimated_stop_loss == 10
+
+
+def test_long_stop_can_be_limited_to_five_percent_roi_with_fees():
+    plan = make_planner(
+        leverage=10,
+        max_stop_roi_percent=5,
+    ).create_plan(
+        make_signal(stop_loss=45),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.signal_stop_loss == 45
+    assert plan.stop_loss == 49.81
+    assert plan.stop_loss_limited_by_roi is True
+    assert plan.total_quantity == 2
+    assert plan.estimated_stop_roi_percent <= 5
+    assert plan.estimated_stop_loss_with_fees <= plan.risk_budget
+
+
+def test_short_stop_can_be_limited_to_five_percent_roi_with_fees():
+    plan = make_planner(
+        leverage=10,
+        max_stop_roi_percent=5,
+    ).create_plan(
+        make_signal(side=OrderSide.SHORT, stop_loss=55),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.signal_stop_loss == 55
+    assert plan.stop_loss == 50.18
+    assert plan.stop_loss_limited_by_roi is True
+    assert plan.total_quantity == 2
+    assert plan.estimated_stop_roi_percent <= 5
+    assert plan.estimated_stop_loss_with_fees <= plan.risk_budget
+
+
+def test_roi_limit_keeps_a_safer_signal_stop():
+    plan = make_planner(
+        leverage=10,
+        max_stop_roi_percent=5,
+    ).create_plan(
+        make_signal(stop_loss=49.9),
+        AccountBalance("USDT", "1000"),
+    )
+
+    assert plan.stop_loss == 49.9
+    assert plan.stop_loss_limited_by_roi is False
+    assert plan.estimated_stop_roi_percent < 5
+
+
+def test_roi_limit_rejects_leverage_when_fees_exceed_budget():
+    with pytest.raises(
+        TradePlanningError,
+        match="комиссии.*исчерпывают лимит",
+    ):
+        make_planner(
+            leverage=100,
+            max_stop_roi_percent=5,
+        ).create_plan(
+            make_signal(),
+            AccountBalance("USDT", "1000"),
+        )
 
 
 def test_position_size_is_capped_by_available_margin():

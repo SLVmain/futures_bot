@@ -25,6 +25,9 @@ class TradePlan:
     leverage: int
     risk_percent: float
     risk_budget: float
+    signal_stop_loss: float | None = None
+    max_stop_roi_percent: float | None = None
+    taker_fee_rate: float = 0.0
     limit_price: float | None = None
     trigger_price: float | None = None
     raw_take_profits: tuple[float, ...] = ()
@@ -61,11 +64,38 @@ class TradePlan:
         )
 
     @property
+    def estimated_stop_fees(self) -> float:
+        return (
+            (self.planned_entry_price + self.stop_loss)
+            * self.total_quantity
+            * self.taker_fee_rate
+        )
+
+    @property
+    def estimated_stop_loss_with_fees(self) -> float:
+        return self.estimated_stop_loss + self.estimated_stop_fees
+
+    @property
     def margin_required(self) -> float:
         return (
             self.total_quantity
             * self.planned_entry_price
             / self.leverage
+        )
+
+    @property
+    def estimated_stop_roi_percent(self) -> float:
+        margin = self.margin_required
+        if margin <= 0:
+            return 0.0
+        return self.estimated_stop_loss_with_fees / margin * 100
+
+    @property
+    def stop_loss_limited_by_roi(self) -> bool:
+        return (
+            self.max_stop_roi_percent is not None
+            and self.signal_stop_loss is not None
+            and self.stop_loss != self.signal_stop_loss
         )
 
     def to_order_info(self) -> dict:
@@ -83,6 +113,9 @@ class TradePlan:
             "in_range": self.in_range,
             "total_quantity": self.total_quantity,
             "stop_loss": self.stop_loss,
+            "signal_stop_loss": self.signal_stop_loss,
+            "stop_loss_limited_by_roi": self.stop_loss_limited_by_roi,
+            "max_stop_roi_percent": self.max_stop_roi_percent,
             "take_profits": [
                 item.price for item in self.take_profits
             ],
@@ -93,6 +126,13 @@ class TradePlan:
             "risk_percent": self.risk_percent,
             "risk_budget": self.risk_budget,
             "estimated_stop_loss": self.estimated_stop_loss,
+            "estimated_stop_fees": self.estimated_stop_fees,
+            "estimated_stop_loss_with_fees": (
+                self.estimated_stop_loss_with_fees
+            ),
+            "estimated_stop_roi_percent": (
+                self.estimated_stop_roi_percent
+            ),
             "margin_required": self.margin_required,
             "api_execution_supported": self.api_execution_supported,
         }

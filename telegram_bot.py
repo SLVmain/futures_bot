@@ -66,6 +66,7 @@ load_dotenv()
 WAITING_LEVERAGE = 1
 WAITING_RISK = 2
 WAITING_TP_STRATEGY = 3
+WAITING_STOP_LOSS = 4
 SIGNAL_KEY = "signal"
 LEVERAGE_KEY = "leverage"
 RISK_KEY = "risk"
@@ -428,7 +429,11 @@ class FuturesBot:
                 plan.raw_take_profits
                 or tuple(item.price for item in plan.take_profits)
             ),
-            stop_loss=plan.stop_loss,
+            stop_loss=(
+                plan.signal_stop_loss
+                if plan.signal_stop_loss is not None
+                else plan.stop_loss
+            ),
         )
         try:
             account = await asyncio.to_thread(
@@ -446,6 +451,8 @@ class FuturesBot:
                         2,
                     ),
                     enable_emulated_triggers=False,
+                    max_stop_roi_percent=plan.max_stop_roi_percent,
+                    taker_fee_rate=plan.taker_fee_rate,
                 ),
             )
             new_plan = await asyncio.to_thread(
@@ -973,6 +980,19 @@ class FuturesBot:
             for count in cls._tp_strategy_options(signal)
         ])
 
+    @staticmethod
+    def _stop_loss_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "SL из сигнала",
+                callback_data="stop_loss:signal",
+            )],
+            [InlineKeyboardButton(
+                "Ограничить до −5% ROI",
+                callback_data="stop_loss:roi5",
+            )],
+        ])
+
     async def leverage_button_handler(
         self,
         update: Update,
@@ -1081,13 +1101,44 @@ class FuturesBot:
         context.user_data[SIGNAL_KEY] = selected_signal
         await query.edit_message_reply_markup(reply_markup=None)
         progress_message = await query.message.reply_text(
-            f"✅ Выбрано TP: {tp_count}\n⏳ Считаю..."
+            f"✅ Выбрано TP: {tp_count}\n"
+            "Какой стоп-лосс использовать?",
+            reply_markup=self._stop_loss_keyboard(),
+        )
+        return WAITING_STOP_LOSS
+
+    async def stop_loss_button_handler(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        if not await self._authorize(update):
+            return ConversationHandler.END
+        query = update.callback_query
+        await query.answer()
+        signal = context.user_data.get(SIGNAL_KEY)
+        leverage = context.user_data.get(LEVERAGE_KEY)
+        risk = context.user_data.get(RISK_KEY)
+        if signal is None or leverage is None or risk is None:
+            await query.edit_message_text(
+                "❌ Сессия устарела. Отправьте сигнал заново."
+            )
+            return ConversationHandler.END
+
+        mode = query.data.split(":", 1)[1]
+        max_stop_roi_percent = 5.0 if mode == "roi5" else None
+        await query.edit_message_reply_markup(reply_markup=None)
+        progress_message = await query.message.reply_text(
+            "✅ SL ограничен расчётным −5% ROI\n⏳ Считаю..."
+            if max_stop_roi_percent is not None
+            else "✅ Используется SL из сигнала\n⏳ Считаю..."
         )
         return await self._calculate_selected_risk(
             query.message,
             progress_message,
             context,
             risk,
+            max_stop_roi_percent=max_stop_roi_percent,
         )
 
     async def _calculate_selected_risk(
@@ -1096,6 +1147,8 @@ class FuturesBot:
         progress_message,
         context,
         risk,
+        *,
+        max_stop_roi_percent=None,
     ):
         signal = context.user_data.get(SIGNAL_KEY)
         leverage = context.user_data.get(LEVERAGE_KEY)
@@ -1113,6 +1166,7 @@ class FuturesBot:
             signal,
             leverage,
             risk,
+            max_stop_roi_percent=max_stop_roi_percent,
         )
         return ConversationHandler.END
 
@@ -1124,11 +1178,19 @@ class FuturesBot:
         signal,
         leverage,
         risk,
+        *,
+        max_stop_roi_percent=None,
     ) -> None:
         try:
             settings = TradeSettings(
                 leverage=leverage,
                 risk_percent=risk,
+                max_stop_roi_percent=max_stop_roi_percent,
+                taker_fee_rate=float(getattr(
+                    getattr(self, "monitoring", None),
+                    "taker_fee_rate",
+                    0.0006,
+                )),
                 tp_offset_ticks=getattr(
                     self,
                     "take_profit_offset_ticks",
@@ -1173,6 +1235,7 @@ class FuturesBot:
             planned_entry = order_info["planned_entry_price"]
             total_qty = order_info["total_quantity"]
             sl = order_info["stop_loss"]
+            signal_sl = order_info["signal_stop_loss"]
             take_profits = order_info["take_profits"]
             tp_quantities = order_info["tp_quantities"]
             risk_budget = order_info["risk_budget"]
@@ -1182,6 +1245,16 @@ class FuturesBot:
                 sl_loss = (planned_entry - sl) * total_qty
             else:
                 sl_loss = (sl - planned_entry) * total_qty
+
+            stop_loss_with_fees = (
+                order_info["estimated_stop_loss_with_fees"]
+            )
+            stop_roi = order_info["estimated_stop_roi_percent"]
+            calculated_risk = (
+                stop_loss_with_fees
+                if max_stop_roi_percent is not None
+                else sl_loss
+            )
             
             text = f"📊 *РАСЧЁТ*\n\n"
             if manual_only:
@@ -1212,11 +1285,33 @@ class FuturesBot:
             text += f"Плановая цена входа: {planned_entry}\n"
             text += f"Объём: {total_qty}\n"
             text += f"Позиция: {position_value:.2f} USDT\n"
-            text += f"SL: {sl} (−{sl_loss:.2f} USDT)\n\n"
+            if plan.stop_loss_limited_by_roi:
+                text += f"SL сигнала: {signal_sl}\n"
+                text += (
+                    f"Итоговый SL: {sl} "
+                    f"(ограничение −{max_stop_roi_percent:g}% ROI)\n"
+                )
+            elif max_stop_roi_percent is not None:
+                text += (
+                    f"SL: {sl} — сигнальный стоп уже ближе лимита "
+                    f"−{max_stop_roi_percent:g}% ROI\n"
+                )
+            else:
+                text += f"SL: {sl} (−{sl_loss:.2f} USDT)\n"
+            text += (
+                f"Расчётный убыток с taker-комиссиями: "
+                f"−{stop_loss_with_fees:.2f} USDT "
+                f"(ROI −{stop_roi:.2f}%)\n\n"
+            )
             text += (
                 f"Риск-бюджет: {risk_budget:.2f} USDT\n"
-                f"Расчётный риск: {sl_loss:.2f} USDT\n\n"
+                f"Расчётный риск: {calculated_risk:.2f} USDT\n\n"
             )
+            if max_stop_roi_percent is not None:
+                text += (
+                    "⚠️ ROI расчётный: проскальзывание, funding и гэп "
+                    "могут увеличить фактический убыток.\n\n"
+                )
             exposure_warning = self._existing_exposure_warning(
                 signal.symbol,
                 existing_orders,
@@ -2364,6 +2459,12 @@ def main():
                 CallbackQueryHandler(
                     bot.tp_strategy_button_handler,
                     pattern=r"^tp_strategy:(1|2|3|4|5)$",
+                ),
+            ],
+            WAITING_STOP_LOSS: [
+                CallbackQueryHandler(
+                    bot.stop_loss_button_handler,
+                    pattern=r"^stop_loss:(signal|roi5)$",
                 ),
             ],
         },
