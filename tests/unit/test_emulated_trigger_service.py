@@ -13,6 +13,7 @@ from models.trade import (
     TradePlan,
 )
 from services.emulated_trigger_service import (
+    EmulatedTrigger,
     EmulatedTriggerService,
     EmulatedTriggerStore,
 )
@@ -137,7 +138,7 @@ def make_service(tmp_path, market, executor=None, orders=None, **settings):
     messages = []
     registered = []
 
-    async def notify(text):
+    async def notify(text, action_id=None):
         messages.append(text)
 
     async def register(plan, result):
@@ -171,6 +172,27 @@ def test_trigger_is_persisted_and_suspended_after_restart(tmp_path):
             assert len(suspended) == 1
             assert suspended[0].status == "SUSPENDED"
             assert suspended[0].last_price == 60
+        finally:
+            await restored.stop()
+
+    asyncio.run(scenario())
+
+
+def test_legacy_expired_trigger_is_migrated_to_pending_decision(tmp_path):
+    async def scenario():
+        service, _, _ = make_service(tmp_path, Market(60))
+        record = await service.arm(make_plan())
+        service.records[record.plan.execution_id] = replace(
+            record,
+            status="EXPIRED",
+        )
+        service.store.save(service.records)
+
+        restored, _, _ = make_service(tmp_path, Market(60))
+        attention_required = await restored.start()
+        try:
+            assert len(attention_required) == 1
+            assert attention_required[0].status == restored.EXPIRED_PENDING
         finally:
             await restored.stop()
 
@@ -272,6 +294,87 @@ def test_active_trigger_suspends_when_price_becomes_unavailable(tmp_path):
 
         assert service.get("trigger-one").status == "SUSPENDED"
         assert "позднего входа не будет" in messages[0]
+
+    asyncio.run(scenario())
+
+
+def test_expired_trigger_waits_for_keep_or_cancel_decision(tmp_path):
+    async def scenario():
+        executor = Executor()
+        service, messages, _ = make_service(
+            tmp_path,
+            Market(60),
+            executor,
+            max_age_seconds=10,
+        )
+        actions = []
+
+        async def notify(text, action_id=None):
+            messages.append(text)
+            actions.append(action_id)
+
+        service.notify = notify
+        record = await service.arm(make_plan())
+        expired = replace(record, created_at=record.created_at - 11)
+        service.records[record.plan.execution_id] = expired
+
+        await service._check(expired)
+
+        assert executor.plans == []
+        assert service.get("trigger-one").status == service.EXPIRED_PENDING
+        assert "Сохранить ожидание" in messages[-1]
+        assert actions[-1] == "trigger-expired:trigger-one"
+        assert service.waiting() == (service.get("trigger-one"),)
+
+    asyncio.run(scenario())
+
+
+def test_keep_expired_trigger_rechecks_price_and_renews_age(tmp_path):
+    async def scenario():
+        service, _, _ = make_service(
+            tmp_path,
+            Market(60),
+            max_age_seconds=10,
+        )
+        record = await service.arm(make_plan())
+        old_created_at = record.created_at - 11
+        service.records[record.plan.execution_id] = replace(
+            record,
+            status=service.EXPIRED_PENDING,
+            created_at=old_created_at,
+        )
+
+        ok, message, price = await service.keep_waiting("trigger-one")
+
+        renewed = service.get("trigger-one")
+        assert ok is True
+        assert "срок отсчитывается заново" in message
+        assert price == 60
+        assert renewed.status == service.ACTIVE
+        assert renewed.created_at > old_created_at
+
+    asyncio.run(scenario())
+
+
+def test_keep_expired_trigger_blocks_late_entry_after_crossing(tmp_path):
+    async def scenario():
+        service, _, _ = make_service(tmp_path, Market(49))
+        plan = make_plan()
+        now = 1.0
+        service.records[plan.execution_id] = EmulatedTrigger(
+            plan,
+            service.EXPIRED_PENDING,
+            now,
+            now,
+            60,
+        )
+
+        ok, message, price = await service.keep_waiting("trigger-one")
+
+        assert ok is False
+        assert "поздний вход заблокирован" in message
+        assert price == 49
+        assert service.get("trigger-one").status == service.EXPIRED_PENDING
 
     asyncio.run(scenario())
 

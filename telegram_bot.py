@@ -80,6 +80,17 @@ SIGNAL_UPDATE_PATTERN = re.compile(
 )
 
 
+def configure_application_logging() -> None:
+    if not LOGGER.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"
+        ))
+        LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+
+
 async def telegram_error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -150,6 +161,7 @@ class FuturesBot:
             BotCommand("mode", "Показать режим торговли"),
             BotCommand("positions", "Открытые позиции"),
             BotCommand("orders", "Активные ордера"),
+            BotCommand("triggers", "Триггеры в ожидании цены"),
             BotCommand("trades", "Последние сделки журнала"),
             BotCommand("stats", "Статистика торговли"),
             BotCommand("export", "Скачать журнал сделок"),
@@ -172,8 +184,24 @@ class FuturesBot:
             text: str,
             action_id: str | None = None,
         ) -> None:
+            LOGGER.info(
+                "Исходящее служебное сообщение Telegram: %s",
+                text.replace("\n", " | "),
+            )
             reply_markup = None
-            if action_id is not None:
+            if action_id and action_id.startswith("trigger-expired:"):
+                execution_id = action_id.split(":", 1)[1]
+                reply_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "✅ Сохранить ожидание",
+                        callback_data=f"trigger:keep:{execution_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Отменить",
+                        callback_data=f"trigger:cancel:{execution_id}",
+                    ),
+                ]])
+            elif action_id is not None:
                 reply_markup = InlineKeyboardMarkup([[
                     InlineKeyboardButton(
                         "✅ Перенести SL",
@@ -292,8 +320,8 @@ class FuturesBot:
                     self.triggers.limit_timeout_seconds
                 ),
             )
-            suspended = await self.trigger_service.start()
-            for record in suspended:
+            attention_required = await self.trigger_service.start()
+            for record in attention_required:
                 await self._send_trigger_recovery(application, record)
 
     async def post_shutdown(self, application: Application) -> None:
@@ -321,11 +349,23 @@ class FuturesBot:
             f"TP{i} {tp.price} × {tp.quantity}"
             for i, tp in enumerate(plan.take_profits, 1)
         )
+        expired = (
+            record.status == self.trigger_service.EXPIRED_PENDING
+        )
+        heading = (
+            "⌛ Истёк срок ожидания триггера"
+            if expired
+            else "⚠️ Найден приостановленный триггер"
+        )
         text = (
-            f"⚠️ Найден приостановленный триггер "
+            f"{heading} "
             f"{plan.side.value} {plan.symbol}\n\n"
-            "Во время остановки бота цена могла пересечь уровень.\n"
-            "Автоматический вход не выполнен.\n\n"
+            + (
+                "Бот не отменил триггер и ждёт вашего решения.\n"
+                if expired
+                else "Во время остановки бота цена могла пересечь уровень.\n"
+            )
+            + "Автоматический вход не выполнен.\n\n"
             f"Создан: {age_minutes} мин. назад\n"
             f"Условие: {condition}\n"
             f"Триггер: {plan.trigger_price}\n"
@@ -363,6 +403,17 @@ class FuturesBot:
                     callback_data=f"trigger:cancel:{plan.execution_id}",
                 ),
             ]]
+        elif expired:
+            buttons = [[
+                InlineKeyboardButton(
+                    "✅ Сохранить ожидание",
+                    callback_data=f"trigger:keep:{plan.execution_id}",
+                ),
+                InlineKeyboardButton(
+                    "❌ Отменить",
+                    callback_data=f"trigger:cancel:{plan.execution_id}",
+                ),
+            ]]
         else:
             buttons = [[
                 InlineKeyboardButton(
@@ -374,6 +425,10 @@ class FuturesBot:
                     callback_data=f"trigger:cancel:{plan.execution_id}",
                 ),
             ]]
+        LOGGER.info(
+            "Исходящее служебное сообщение Telegram: %s",
+            text.replace("\n", " | "),
+        )
         for chat_id in self.access.allowed_user_ids:
             await application.bot.send_message(
                 chat_id=chat_id,
@@ -411,9 +466,64 @@ class FuturesBot:
             return
         if action == "rearm":
             ok, message, price = await self.trigger_service.rearm(execution_id)
+            reply_markup = None
+            current = self.trigger_service.get(execution_id)
+            if (
+                not ok
+                and current is not None
+                and current.status == self.trigger_service.EXPIRED_PENDING
+            ):
+                reply_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "✅ Сохранить ожидание",
+                        callback_data=f"trigger:keep:{execution_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Отменить",
+                        callback_data=f"trigger:cancel:{execution_id}",
+                    ),
+                ]])
             await query.edit_message_text(
                 f"{'✅' if ok else '⚠️'} {message}\n"
-                f"Текущая цена Bitunix: {price or 'недоступна'}"
+                f"Текущая цена Bitunix: {price or 'недоступна'}",
+                reply_markup=reply_markup,
+            )
+            return
+        if action == "keep":
+            ok, message, price = await self.trigger_service.keep_waiting(
+                execution_id
+            )
+            reply_markup = None
+            if not ok:
+                if price is not None and record.condition_met(price):
+                    buttons = [[
+                        InlineKeyboardButton(
+                            "🧮 Пересчитать вход сейчас",
+                            callback_data=(
+                                f"trigger:recalculate:{execution_id}"
+                            ),
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Отменить триггер",
+                            callback_data=f"trigger:cancel:{execution_id}",
+                        ),
+                    ]]
+                else:
+                    buttons = [[
+                        InlineKeyboardButton(
+                            "🔄 Попробовать сохранить снова",
+                            callback_data=f"trigger:keep:{execution_id}",
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Отменить",
+                            callback_data=f"trigger:cancel:{execution_id}",
+                        ),
+                    ]]
+                reply_markup = InlineKeyboardMarkup(buttons)
+            await query.edit_message_text(
+                f"{'✅' if ok else '⚠️'} {message}\n"
+                f"Текущая цена Bitunix: {price or 'недоступна'}",
+                reply_markup=reply_markup,
             )
             return
         if action != "recalculate":
@@ -521,6 +631,7 @@ class FuturesBot:
             "/mode — текущий режим торговли\n"
             "/positions — открытые позиции\n"
             "/orders — активные ордера\n"
+            "/triggers — триггеры в ожидании цены\n"
             "/trades — последние сделки\n"
             "/stats — статистика торговли\n"
             "/export — скачать журнал сделок\n"
@@ -541,6 +652,78 @@ class FuturesBot:
         if not await self._authorize(update):
             return
         await update.effective_message.reply_text("✅ Бот отвечает")
+
+    async def waiting_triggers(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update):
+            return
+        if self.trigger_service is None:
+            await update.effective_message.reply_text(
+                "Сервис локальных триггеров выключен"
+            )
+            return
+        records = self.trigger_service.waiting()
+        if not records:
+            await update.effective_message.reply_text(
+                "Триггеров в ожидании цены нет"
+            )
+            return
+        status_labels = {
+            self.trigger_service.ACTIVE: "активен",
+            self.trigger_service.SUSPENDED: "приостановлен",
+            self.trigger_service.EXPIRED_PENDING: "ожидает решения",
+        }
+        lines = ["Триггеры в ожидании цены:"]
+        buttons = []
+        now = time.time()
+        for index, record in enumerate(records, 1):
+            plan = record.plan
+            condition = "≥" if plan.side.value == "LONG" else "≤"
+            age_minutes = max(0, int((now - record.created_at) / 60))
+            lines.extend((
+                "",
+                f"{index}. {plan.side.value} {plan.symbol}",
+                f"Статус: {status_labels.get(record.status, record.status)}",
+                f"Условие: цена {condition} {plan.trigger_price}",
+                f"Последняя цена: {record.last_price or 'нет данных'}",
+                f"Возраст: {age_minutes} мин.",
+            ))
+            if record.status == self.trigger_service.ACTIVE:
+                buttons.append([InlineKeyboardButton(
+                    f"❌ Отменить {index}",
+                    callback_data=(
+                        f"trigger:cancel:{plan.execution_id}"
+                    ),
+                )])
+            elif record.status == self.trigger_service.SUSPENDED:
+                buttons.append([
+                    InlineKeyboardButton(
+                        f"✅ Активировать {index}",
+                        callback_data=f"trigger:rearm:{plan.execution_id}",
+                    ),
+                    InlineKeyboardButton(
+                        f"❌ Отменить {index}",
+                        callback_data=f"trigger:cancel:{plan.execution_id}",
+                    ),
+                ])
+            else:
+                buttons.append([
+                    InlineKeyboardButton(
+                        f"✅ Сохранить {index}",
+                        callback_data=f"trigger:keep:{plan.execution_id}",
+                    ),
+                    InlineKeyboardButton(
+                        f"❌ Отменить {index}",
+                        callback_data=f"trigger:cancel:{plan.execution_id}",
+                    ),
+                ])
+        await update.effective_message.reply_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
 
     async def restart(
         self,
@@ -2406,6 +2589,7 @@ class FuturesBot:
 
 
 def main():
+    configure_application_logging()
     bot = FuturesBot()
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     proxy_url = os.getenv("TELEGRAM_PROXY", None)
@@ -2476,6 +2660,7 @@ def main():
     app.add_handler(CommandHandler("mode", bot.mode))
     app.add_handler(CommandHandler("positions", bot.positions))
     app.add_handler(CommandHandler("orders", bot.orders))
+    app.add_handler(CommandHandler("triggers", bot.waiting_triggers))
     app.add_handler(CommandHandler("trades", bot.trades))
     app.add_handler(CommandHandler("stats", bot.stats))
     app.add_handler(CommandHandler("export", bot.export_journal))

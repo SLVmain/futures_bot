@@ -171,6 +171,76 @@ def test_trigger_cancel_button_reports_success(tmp_path):
     asyncio.run(scenario())
 
 
+def test_waiting_triggers_command_lists_statuses_and_actions(tmp_path):
+    class FakeTriggerService:
+        ACTIVE = "ARMED"
+        SUSPENDED = "SUSPENDED"
+        EXPIRED_PENDING = "EXPIRED_PENDING"
+
+        def waiting(self):
+            plan = SimpleNamespace(
+                side=SimpleNamespace(value="LONG"),
+                symbol="BTCUSDT",
+                trigger_price=50,
+                execution_id="execution-1",
+            )
+            return (SimpleNamespace(
+                plan=plan,
+                status=self.EXPIRED_PENDING,
+                created_at=1,
+                last_price=49,
+            ),)
+
+    async def scenario():
+        bot = make_bot(tmp_path)
+        bot.trigger_service = FakeTriggerService()
+        update = FakeUpdate()
+
+        await bot.waiting_triggers(update, SimpleNamespace())
+
+        text, kwargs = update.message.replies[-1]
+        assert "BTCUSDT" in text
+        assert "ожидает решения" in text
+        callbacks = [
+            button.callback_data
+            for row in kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert "trigger:keep:execution-1" in callbacks
+        assert "trigger:cancel:execution-1" in callbacks
+
+    asyncio.run(scenario())
+
+
+def test_keep_expired_trigger_button_reports_renewal(tmp_path):
+    class FakeTriggerService:
+        EXPIRED_PENDING = "EXPIRED_PENDING"
+
+        def get(self, execution_id):
+            return SimpleNamespace(
+                condition_met=lambda price: False,
+            )
+
+        async def keep_waiting(self, execution_id):
+            return True, "Ожидание сохранено", 49
+
+    async def scenario():
+        bot = make_bot(tmp_path)
+        bot.trigger_service = FakeTriggerService()
+        update = FakeUpdate(callback_data="trigger:keep:execution-1")
+
+        await bot.trigger_button_handler(
+            update,
+            SimpleNamespace(user_data={}),
+        )
+
+        text, kwargs = update.callback_query.edits[-1]
+        assert "Ожидание сохранено" in text
+        assert kwargs["reply_markup"] is None
+
+    asyncio.run(scenario())
+
+
 def test_missing_symbol_exposure_is_informational(tmp_path):
     async def scenario():
         bot = make_bot(tmp_path)

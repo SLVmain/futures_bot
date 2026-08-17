@@ -92,15 +92,16 @@ class FakeProtections:
         return "sl-restored"
 
 
-def make_monitor(tmp_path, notifications, **kwargs):
+def make_monitor(tmp_path, notifications, journal=None, **kwargs):
     async def notify(message, action_id=None):
         notifications.append(message)
 
+    kwargs.setdefault("exit_notification_delay", 0)
     return PositionMonitor(
         FakeOrders(),
         FakePositions(),
         FakeProtections(),
-        CsvTradeJournal(tmp_path / "journal.csv"),
+        journal or CsvTradeJournal(tmp_path / "journal.csv"),
         notify,
         **kwargs,
     )
@@ -216,6 +217,91 @@ def test_split_entry_protection_checks_are_combined(tmp_path):
     )
 
 
+def test_split_entry_waits_for_all_fills_before_position_check(
+    tmp_path,
+    run_blocking_calls_inline,
+):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        plan = TradePlan(
+            symbol="BTCUSDT",
+            side=OrderSide.LONG,
+            entry_min=49,
+            entry_max=51,
+            current_price=50,
+            in_range=True,
+            total_quantity=3,
+            stop_loss=45,
+            take_profits=(
+                PlannedTakeProfit(55, 1),
+                PlannedTakeProfit(60, 1),
+                PlannedTakeProfit(65, 1),
+            ),
+            leverage=10,
+            risk_percent=1,
+            risk_budget=10,
+        )
+        positions = tuple(
+            replace(
+                make_position(),
+                position_id=f"position-{index}",
+                quantity="1",
+            )
+            for index in range(1, 4)
+        )
+        position_calls = 0
+
+        def get_positions(*args):
+            nonlocal position_calls
+            position_calls += 1
+            return positions
+
+        monitor.positions.get_open_positions = get_positions
+        monitor.protections.pending = [
+            {
+                "id": f"tp-{index}",
+                "positionId": f"position-{index}",
+                "tpPrice": str(price),
+                "tpQty": "1",
+            }
+            for index, price in enumerate((55, 60, 65), 1)
+        ]
+        for index in range(1, 4):
+            monitor.register_plan(
+                f"bot-execution-abc-{index}",
+                plan,
+                tp_number=index,
+            )
+
+        for index in range(1, 4):
+            await monitor.handle_event({
+                "ch": "order",
+                "ts": 100 + index,
+                "data": {
+                    "orderId": f"order-{index}",
+                    "clientId": f"bot-execution-abc-{index}",
+                    "symbol": "BTCUSDT",
+                    "orderStatus": "FILLED",
+                    "side": "BUY",
+                    "averagePrice": "50",
+                    "dealAmount": "1",
+                    "fee": "0.01",
+                },
+            })
+            if index < 3:
+                assert position_calls == 0
+
+        assert sum("открыт" in item for item in notifications) == 1
+        assert sum("Защита BTCUSDT проверена" in item for item in notifications) == 1
+        assert not any(
+            "позиция не появилась" in item
+            for item in notifications
+        )
+
+    asyncio.run(scenario())
+
+
 def test_bot_position_open_event_is_suppressed(tmp_path):
     async def scenario():
         monitor = make_monitor(tmp_path, [])
@@ -238,6 +324,7 @@ def test_bot_position_open_event_is_suppressed(tmp_path):
 
 def test_take_profit_fill_notification_contains_position_data(
     tmp_path,
+    run_blocking_calls_inline,
 ):
     async def scenario():
         notifications = []
@@ -260,7 +347,7 @@ def test_take_profit_fill_notification_contains_position_data(
 
         message = notifications[0]
         assert "Исполнен TP2" in message
-        assert "Позиция: SHORT BTCUSDT" in message
+        assert "Позиция: LONG BTCUSDT" in message
         assert "Триггер: 45" in message
         assert "Закрыто: 0.3" in message
         assert "Остаток: 1" in message
@@ -283,7 +370,10 @@ def test_take_profit_fill_notification_contains_position_data(
     asyncio.run(scenario())
 
 
-def test_stop_loss_fill_reports_closed_position(tmp_path):
+def test_stop_loss_fill_reports_closed_position(
+    tmp_path,
+    run_blocking_calls_inline,
+):
     async def scenario():
         notifications = []
         monitor = make_monitor(tmp_path, notifications)
@@ -325,7 +415,91 @@ def test_stop_loss_fill_reports_closed_position(tmp_path):
     asyncio.run(scenario())
 
 
-def test_closed_position_writes_trade_summary(tmp_path):
+def test_split_stop_and_close_events_create_one_summary(
+    tmp_path,
+    run_blocking_calls_inline,
+):
+    async def scenario():
+        notifications = []
+        journal = CsvTradeJournal(tmp_path / "journal.csv")
+        for index in range(1, 4):
+            journal.save_tp_order(
+                f"tp-{index}",
+                f"position-{index}",
+                f"bot-execution-abc-{index}",
+                index,
+            )
+        monitor = make_monitor(
+            tmp_path,
+            notifications,
+            journal=journal,
+            exit_notification_delay=0.01,
+        )
+
+        quantities = ("0.5", "0.3", "0.2")
+        realized_values = ("-3", "-2", "-1")
+        fee_values = ("0.3", "0.2", "0.1")
+        for index, quantity in enumerate(quantities, 1):
+            await monitor.handle_event({
+                "ch": "tpsl",
+                "ts": 300 + index,
+                "data": {
+                    "orderId": f"sl-{index}",
+                    "positionId": f"position-{index}",
+                    "symbol": "BTCUSDT",
+                    "side": "SELL",
+                    "status": "FILLED",
+                    "slPrice": "45",
+                    "slQty": quantity,
+                },
+            })
+        for index, (realized, fee) in enumerate(
+            zip(realized_values, fee_values),
+            1,
+        ):
+            await monitor.handle_event({
+                "ch": "position",
+                "ts": 400 + index,
+                "data": {
+                    "event": "CLOSE",
+                    "positionId": f"position-{index}",
+                    "symbol": "BTCUSDT",
+                    "side": "LONG",
+                    "qty": "0",
+                    "realizedPNL": realized,
+                    "fee": fee,
+                    "funding": "0",
+                },
+            })
+
+        await asyncio.sleep(0.03)
+
+        assert notifications == [
+            "🛑 Позиция закрыта по SL: LONG BTCUSDT\n"
+            "Частей закрыто: 3\n"
+            "Общий объём: 1\n"
+            "SL: 45\n"
+            "Реализованный PnL: -6 USDT\n"
+            "Комиссия: -0.6 USDT\n"
+            "Funding: 0 USDT\n"
+            "Чистый результат: -6.6 USDT"
+        ]
+        with monitor.journal.path.open(
+            encoding="utf-8",
+            newline="",
+        ) as stream:
+            rows = list(csv.DictReader(stream))
+        assert sum(row["event_type"] == "SL" for row in rows) == 3
+        assert sum(
+            row["event_type"] == "TRADE_SUMMARY" for row in rows
+        ) == 3
+    asyncio.run(scenario())
+
+
+def test_closed_position_writes_trade_summary(
+    tmp_path,
+    run_blocking_calls_inline,
+):
     async def scenario():
         notifications = []
         monitor = make_monitor(tmp_path, notifications)
@@ -412,7 +586,10 @@ def test_reconciliation_warns_about_missing_protection(tmp_path):
     asyncio.run(scenario())
 
 
-def test_reconciliation_reports_active_limit_order_once(tmp_path):
+def test_reconciliation_reports_active_limit_order_once(
+    tmp_path,
+    run_blocking_calls_inline,
+):
     async def scenario():
         notifications = []
         monitor = make_monitor(tmp_path, notifications)
@@ -433,6 +610,88 @@ def test_reconciliation_reports_active_limit_order_once(tmp_path):
         assert "TP и SL уже прикреплены на стороне Bitunix" in (
             waiting_messages[0]
         )
+
+    asyncio.run(scenario())
+
+
+def test_reconciliation_combines_split_limit_tracking(
+    tmp_path,
+    run_blocking_calls_inline,
+):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        monitor.positions.get_open_positions = lambda *args: ()
+        monitor.protections.unprotected_positions = (
+            lambda positions, protections: ()
+        )
+        plan = replace(
+            make_single_tp_plan(quantity=3),
+            take_profits=(
+                PlannedTakeProfit(55, 0.75),
+                PlannedTakeProfit(60, 1.5),
+                PlannedTakeProfit(65, 0.75),
+            ),
+        )
+        client_ids = tuple(
+            f"bot-execution-abc-{index}"
+            for index in range(1, 4)
+        )
+        for index, client_id in enumerate(client_ids, 1):
+            monitor.register_plan(
+                client_id,
+                plan,
+                persist=False,
+                tp_number=index,
+            )
+        monitor.orders.get_pending_orders = lambda: tuple(
+            SimpleNamespace(client_id=client_id, status="NEW_")
+            for client_id in client_ids
+        )
+
+        await monitor.reconcile()
+        await monitor.reconcile()
+
+        assert notifications == [
+            "⏳ Контроль лимитного входа активен\n\n"
+            "LONG BTCUSDT\n"
+            "Цена входа: 50\n"
+            "Ожидающих частей: 3 (TP1–TP3)\n\n"
+            "TP и SL уже прикреплены на стороне Bitunix. "
+            "Бот ожидает исполнение только для уведомлений "
+            "и проверки защиты."
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_reconciliation_combines_unprotected_split_positions(
+    tmp_path,
+    run_blocking_calls_inline,
+):
+    async def scenario():
+        notifications = []
+        monitor = make_monitor(tmp_path, notifications)
+        positions = tuple(
+            replace(make_position(), position_id=f"position-{index}")
+            for index in range(1, 4)
+        )
+        monitor.positions.get_open_positions = lambda *args: positions
+        monitor.protections.get_pending_tp_sl = lambda *args: ()
+        monitor.protections.unprotected_positions = (
+            lambda open_positions, protections: tuple(
+                (position, ("SL",)) for position in open_positions
+            )
+        )
+
+        await monitor.reconcile()
+
+        assert len(notifications) == 1
+        assert "Части позиции без защиты: LONG BTCUSDT" in (
+            notifications[0]
+        )
+        assert "Частей: 3" in notifications[0]
+        assert notifications[0].count("• position-") == 3
 
     asyncio.run(scenario())
 

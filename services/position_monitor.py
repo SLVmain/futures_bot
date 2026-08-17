@@ -34,6 +34,24 @@ class EntryFillGroup:
     quantity: Decimal = Decimal("0")
     notional: Decimal = Decimal("0")
     fee: Decimal = Decimal("0")
+    verification_started: bool = False
+    missing_warning_sent: bool = False
+
+
+@dataclass
+class ExitNotificationGroup:
+    symbol: str
+    side: str
+    stop_prices: set[str] = field(default_factory=set)
+    take_profits: dict[str, str] = field(default_factory=dict)
+    position_ids: set[str] = field(default_factory=set)
+    order_ids: set[str] = field(default_factory=set)
+    executed_quantity: Decimal = Decimal("0")
+    has_executed_quantity: bool = False
+    realized_pnl: list[str] = field(default_factory=list)
+    fees: list[str] = field(default_factory=list)
+    funding: list[str] = field(default_factory=list)
+    task: asyncio.Task | None = None
 
 
 class PositionMonitor:
@@ -57,6 +75,7 @@ class PositionMonitor:
         auto_move_stop_loss_on_tp1: bool = False,
         auto_restore_canceled_stop_loss: bool = True,
         canceled_stop_restore_delay: float = 3,
+        exit_notification_delay: float = 4,
     ):
         self.orders = orders
         self.positions = positions
@@ -71,6 +90,12 @@ class PositionMonitor:
             auto_restore_canceled_stop_loss
         )
         self.canceled_stop_restore_delay = canceled_stop_restore_delay
+        if exit_notification_delay < 0:
+            raise ValueError(
+                "Задержка объединения уведомлений не может быть "
+                "отрицательной"
+            )
+        self.exit_notification_delay = exit_notification_delay
         self._plans_by_client_id = journal.load_pending_plans()
         self._tp_numbers_by_client_id = {
             client_id: self._tp_number_from_client_id(client_id)
@@ -81,6 +106,12 @@ class PositionMonitor:
             journal.load_active_tp_order_client_ids()
         )
         self._tp_order_prices = journal.load_tp_order_prices()
+        self._client_ids_by_position = {
+            position_id: self._tp_order_client_ids[order_id]
+            for order_id, (position_id, _)
+            in self._tp_orders.items()
+            if order_id in self._tp_order_client_ids
+        }
         self._tp1_order_positions = {
             order_id: position_id
             for order_id, (position_id, tp_number)
@@ -90,6 +121,10 @@ class PositionMonitor:
         self._break_even_proposals = {}
         self._pending_plan_notifications: set[str] = set()
         self._entry_fill_groups: dict[str, EntryFillGroup] = {}
+        self._exit_notification_groups: dict[
+            str,
+            ExitNotificationGroup,
+        ] = {}
         self._recent_bot_open_symbols: dict[str, float] = {}
         self._stop_restore_tasks: dict[str, asyncio.Task] = {}
         for client_id, plan in self._plans_by_client_id.items():
@@ -214,25 +249,19 @@ class PositionMonitor:
                 self.journal.append,
                 self._trade_summary_event(message, data),
             )
-        notification = await self._notification(
-            channel,
-            data,
-            status,
-            position_snapshot,
-        )
-        if notification:
-            await self.notifier(notification)
+        if self._should_batch_exit_notification(channel, data, status):
+            self._queue_exit_notification(channel, data)
+        else:
+            notification = await self._notification(
+                channel,
+                data,
+                status,
+                position_snapshot,
+            )
+            if notification:
+                await self.notifier(notification)
         if channel == "order" and status == "FILLED":
             await self._verify_attached_protections(data)
-        if channel == "position" and data.get("event") == "OPEN":
-            for client_id, plan in tuple(
-                self._plans_by_client_id.items()
-            ):
-                if plan.symbol == data.get("symbol"):
-                    await self._verify_plan_protections(
-                        plan,
-                        client_id,
-                    )
         if channel == "tpsl" and status == "FILLED":
             await self._handle_take_profit_stop_move(data)
         if channel == "tpsl" and status == "CANCELED":
@@ -243,21 +272,82 @@ class PositionMonitor:
         plan = self._plans_by_client_id.get(client_id)
         if plan is None:
             return
+        group = self._entry_group(client_id)
+        if group is not None:
+            # FILLED is authoritative even if the notification payload lacks
+            # numeric fields needed by the human-readable entry summary.
+            group.filled_client_ids.add(client_id)
+            if group.filled_client_ids != group.expected_client_ids:
+                return
+            await self._verify_entry_group(group)
+            return
         await self._verify_plan_protections(plan, client_id)
+
+    async def _verify_entry_group(
+        self,
+        group: EntryFillGroup,
+        *,
+        allow_incomplete_fill_events: bool = False,
+    ) -> None:
+        if (
+            not allow_incomplete_fill_events
+            and group.filled_client_ids != group.expected_client_ids
+        ):
+            return
+        if group.verification_started:
+            return
+        group.verification_started = True
+        missing_client_ids = []
+        try:
+            for client_id in sorted(group.expected_client_ids):
+                plan = self._plans_by_client_id.get(client_id)
+                if plan is None:
+                    continue
+                position_found = await self._verify_plan_protections(
+                    plan,
+                    client_id,
+                    notify_missing_position=False,
+                )
+                if not position_found:
+                    missing_client_ids.append(client_id)
+        finally:
+            group.verification_started = False
+        if not missing_client_ids or group.missing_warning_sent:
+            return
+        group.missing_warning_sent = True
+        missing_count = len(missing_client_ids)
+        total_count = len(group.expected_client_ids)
+        if total_count == 1:
+            message = (
+                "⚠️ Ордер исполнен, но позиция не появилась "
+                "после повторных проверок. Проверьте вход и "
+                "прикреплённые TP/SL на Bitunix."
+            )
+        else:
+            message = (
+                f"⚠️ После исполнения входа не удалось найти "
+                f"{missing_count} из {total_count} частей позиции "
+                f"{group.symbol} после повторных проверок. "
+                "Проверьте вход и прикреплённые TP/SL на Bitunix."
+            )
+        await self.notifier(message)
 
     async def _verify_plan_protections(
         self,
         plan,
         client_id: str | None = None,
-    ) -> None:
+        *,
+        notify_missing_position: bool = True,
+    ) -> bool:
         position = await self._wait_for_position(plan)
         if position is None:
-            await self.notifier(
-                "⚠️ Ордер исполнен, но позиция не появилась "
-                "после повторных проверок. "
-                "Проверьте вход и прикреплённые TP/SL на Bitunix."
-            )
-            return
+            if notify_missing_position:
+                await self.notifier(
+                    "⚠️ Ордер исполнен, но позиция не появилась "
+                    "после повторных проверок. "
+                    "Проверьте вход и прикреплённые TP/SL на Bitunix."
+                )
+            return False
         existing = await asyncio.to_thread(
             self.protections.get_pending_tp_sl,
             plan.symbol,
@@ -298,7 +388,7 @@ class PositionMonitor:
                 f"{reserved_quantity} > {position_quantity}. "
                 "Мониторинг не будет изменять ордера."
             )
-            return
+            return True
         recovered = 0
         failed = False
         used_existing_ids = set()
@@ -359,6 +449,9 @@ class PositionMonitor:
                     str(price),
                 )
                 self._tp_order_client_ids[tp_order_id] = client_id
+                self._client_ids_by_position[
+                    position.position_id
+                ] = client_id
                 self._tp_order_prices[tp_order_id] = price
                 if index == 1:
                     self._tp1_order_positions[tp_order_id] = (
@@ -422,6 +515,7 @@ class PositionMonitor:
                 self.journal.finish_plan(client_id, "CONFIGURED")
                 self._plans_by_client_id.pop(client_id, None)
                 self._tp_numbers_by_client_id.pop(client_id, None)
+        return True
 
     @staticmethod
     def _tp_number_from_client_id(client_id: str) -> int:
@@ -1035,29 +1129,69 @@ class PositionMonitor:
                 order_id=str(len(orders)),
             ),
         )
+        unprotected_groups = {}
         for position, missing in self.protections.unprotected_positions(
             positions,
             protections,
         ):
-            await self.notifier(
-                "⚠️ Позиция без защиты: "
-                f"{position.side} {position.symbol}, "
-                f"ID {position.position_id}. "
-                f"Отсутствует: {', '.join(missing)}"
+            key = self._position_group_key(
+                position.position_id,
+                position.symbol,
+                position.side,
             )
+            unprotected_groups.setdefault(key, []).append(
+                (position, missing)
+            )
+        for items in unprotected_groups.values():
+            if len(items) == 1:
+                position, missing = items[0]
+                await self.notifier(
+                    "⚠️ Позиция без защиты: "
+                    f"{position.side} {position.symbol}, "
+                    f"ID {position.position_id}. "
+                    f"Отсутствует: {', '.join(missing)}"
+                )
+                continue
+            first_position = items[0][0]
+            lines = [
+                "⚠️ Части позиции без защиты: "
+                f"{first_position.side} {first_position.symbol}",
+                f"Частей: {len(items)}",
+            ]
+            lines.extend(
+                f"• {position.position_id}: {', '.join(missing)}"
+                for position, missing in items
+            )
+            await self.notifier("\n".join(lines))
+        pending_groups = {}
+        verified_entry_groups = set()
         for client_id, plan in tuple(
             self._plans_by_client_id.items()
         ):
+            if client_id not in self._plans_by_client_id:
+                continue
             position_visible = any(
                 position.symbol == plan.symbol
                 and position.side == plan.side.value
                 for position in positions
             )
             if position_visible:
-                await self._verify_plan_protections(
-                    plan,
-                    client_id,
-                )
+                group = self._entry_group(client_id)
+                group_key = self._execution_client_prefix(client_id)
+                if (
+                    group is not None
+                    and group_key not in verified_entry_groups
+                ):
+                    verified_entry_groups.add(group_key)
+                    await self._verify_entry_group(
+                        group,
+                        allow_incomplete_fill_events=True,
+                    )
+                elif group is None and group_key not in verified_entry_groups:
+                    await self._verify_plan_protections(
+                        plan,
+                        client_id,
+                    )
             pending_order = next(
                 (
                     order
@@ -1076,20 +1210,235 @@ class PositionMonitor:
                 status = str(detail.get("status", "")).rstrip("_")
             if status in {"CANCELED", "PART_FILLED_CANCELED"}:
                 self.discard_plan(client_id)
-            elif (
-                status in {"INIT", "NEW", "PART_FILLED"}
-                and client_id not in self._pending_plan_notifications
-            ):
-                self._pending_plan_notifications.add(client_id)
-                await self.notifier(
-                    "⏳ Контроль лимитного входа активен\n\n"
-                    f"{plan.side.value} {plan.symbol}\n"
-                    f"Цена входа: {plan.planned_entry_price}\n"
-                    f"Запланировано TP: {len(plan.take_profits)}\n\n"
-                    "TP и SL уже прикреплены на стороне Bitunix. "
-                    "Бот ожидает исполнение только для уведомлений "
-                    "и проверки защиты."
+            elif status in {"INIT", "NEW", "PART_FILLED"}:
+                group_key = (
+                    self._execution_client_prefix(client_id)
+                    or client_id
                 )
+                if group_key not in self._pending_plan_notifications:
+                    pending_groups.setdefault(group_key, []).append(
+                        (client_id, plan)
+                    )
+        for group_key, items in pending_groups.items():
+            self._pending_plan_notifications.add(group_key)
+            plan = items[0][1]
+            tp_numbers = sorted({
+                tp_number
+                for client_id, item_plan in items
+                for tp_number in range(
+                    self._tp_numbers_by_client_id.get(client_id, 1),
+                    self._tp_numbers_by_client_id.get(client_id, 1)
+                    + len(item_plan.take_profits),
+                )
+            })
+            tp_range = (
+                f"TP{tp_numbers[0]}"
+                if len(tp_numbers) == 1
+                else f"TP{tp_numbers[0]}–TP{tp_numbers[-1]}"
+            )
+            await self.notifier(
+                "⏳ Контроль лимитного входа активен\n\n"
+                f"{plan.side.value} {plan.symbol}\n"
+                f"Цена входа: {plan.planned_entry_price}\n"
+                f"Ожидающих частей: {len(tp_numbers)} "
+                f"({tp_range})\n\n"
+                "TP и SL уже прикреплены на стороне Bitunix. "
+                "Бот ожидает исполнение только для уведомлений "
+                "и проверки защиты."
+            )
+
+    def _should_batch_exit_notification(
+        self,
+        channel: str,
+        data: dict,
+        status: str,
+    ) -> bool:
+        if self.exit_notification_delay <= 0:
+            return False
+        return (
+            channel == "tpsl"
+            and status == "FILLED"
+        ) or (
+            channel == "position"
+            and data.get("event") == "CLOSE"
+        )
+
+    def _queue_exit_notification(
+        self,
+        channel: str,
+        data: dict,
+    ) -> None:
+        symbol = str(data.get("symbol", ""))
+        side = self._position_side_for_event(channel, data)
+        position_id = str(data.get("positionId", ""))
+        group_key = self._position_group_key(
+            position_id,
+            symbol,
+            side,
+        )
+        group = self._exit_notification_groups.setdefault(
+            group_key,
+            ExitNotificationGroup(symbol=symbol, side=side),
+        )
+        if position_id:
+            group.position_ids.add(position_id)
+        order_id = str(data.get("orderId", ""))
+        if order_id:
+            group.order_ids.add(order_id)
+        if channel == "tpsl":
+            stop_price = str(data.get("slPrice", ""))
+            take_profit = str(data.get("tpPrice", ""))
+            if stop_price:
+                group.stop_prices.add(stop_price)
+            if take_profit:
+                tracked = self._tp_orders.get(order_id)
+                label = f"TP{tracked[1]}" if tracked else "TP"
+                group.take_profits[label] = take_profit
+            raw_quantity = (
+                data.get("tpQty")
+                or data.get("slQty")
+                or data.get("qty")
+            )
+            if raw_quantity not in (None, ""):
+                try:
+                    group.executed_quantity += Decimal(
+                        str(raw_quantity)
+                    )
+                    group.has_executed_quantity = True
+                except InvalidOperation:
+                    pass
+        elif channel == "position":
+            group.realized_pnl.append(str(data.get("realizedPNL", "")))
+            group.fees.append(str(data.get("fee", "")))
+            group.funding.append(str(data.get("funding", "")))
+        if group.task is None:
+            group.task = asyncio.create_task(
+                self._flush_exit_notification(group_key),
+                name=f"exit-notification-{group_key}",
+            )
+
+    async def _flush_exit_notification(self, group_key: str) -> None:
+        await asyncio.sleep(self.exit_notification_delay)
+        group = self._exit_notification_groups.pop(group_key, None)
+        if group is None:
+            return
+        await self.notifier(self._format_exit_notification(group))
+
+    def _position_group_key(
+        self,
+        position_id: str,
+        symbol: str,
+        side: str,
+    ) -> str:
+        client_id = self._client_ids_by_position.get(position_id, "")
+        execution_prefix = self._execution_client_prefix(client_id)
+        if execution_prefix:
+            return execution_prefix
+        return f"position:{symbol}:{side}"
+
+    @staticmethod
+    def _position_side_for_event(channel: str, data: dict) -> str:
+        side = OpenPosition.normalize_side(data.get("side", ""))
+        if channel != "tpsl":
+            return side
+        return {
+            "LONG": "SHORT",
+            "SHORT": "LONG",
+        }.get(side, side)
+
+    def _format_exit_notification(
+        self,
+        group: ExitNotificationGroup,
+    ) -> str:
+        if group.stop_prices:
+            title = (
+                f"🛑 Позиция закрыта по SL: "
+                f"{group.side} {group.symbol}"
+            )
+        elif group.take_profits:
+            labels = sorted(
+                group.take_profits,
+                key=self._take_profit_sort_key,
+            )
+            targets = ", ".join(labels)
+            verb = "Исполнен" if len(labels) == 1 else "Исполнены"
+            title = f"🎯 {verb} {targets}: {group.side} {group.symbol}"
+        else:
+            title = f"🏁 Позиция закрыта: {group.side} {group.symbol}"
+        lines = [
+            title,
+            "Частей закрыто: "
+            f"{max(len(group.position_ids), len(group.order_ids), 1)}",
+        ]
+        if group.has_executed_quantity:
+            lines.append(
+                "Общий объём: "
+                f"{self._decimal_text(group.executed_quantity)}"
+            )
+        if group.stop_prices:
+            lines.append(
+                "SL: " + ", ".join(sorted(group.stop_prices))
+            )
+        elif group.take_profits:
+            lines.extend(
+                f"{label}: {group.take_profits[label]}"
+                for label in sorted(
+                    group.take_profits,
+                    key=self._take_profit_sort_key,
+                )
+            )
+        if group.realized_pnl:
+            realized = self._sum_complete_decimals(group.realized_pnl)
+            fees = self._sum_complete_decimals(group.fees)
+            funding = self._sum_complete_decimals(group.funding)
+            net_pnl = (
+                realized + funding - abs(fees)
+                if None not in (realized, fees, funding)
+                else None
+            )
+            lines.extend((
+                "Реализованный PnL: "
+                + (
+                    f"{self._decimal_text(realized)} USDT"
+                    if realized is not None
+                    else "нет данных"
+                ),
+                "Комиссия: "
+                + (
+                    self._expense_text(str(fees))
+                    if fees is not None
+                    else "нет данных"
+                ),
+                "Funding: "
+                + (
+                    f"{self._decimal_text(funding)} USDT"
+                    if funding is not None
+                    else "нет данных"
+                ),
+                "Чистый результат: "
+                + (
+                    f"{self._decimal_text(net_pnl)} USDT"
+                    if net_pnl is not None
+                    else "нет данных"
+                ),
+            ))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _take_profit_sort_key(label: str) -> int:
+        try:
+            return int(label.removeprefix("TP"))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _sum_complete_decimals(values: list[str]) -> Decimal | None:
+        if not values or any(value == "" for value in values):
+            return None
+        try:
+            return sum((Decimal(value) for value in values), Decimal("0"))
+        except InvalidOperation:
+            return None
 
     async def _notification(
         self,
@@ -1151,9 +1500,7 @@ class PositionMonitor:
                 fee = str(data.get("fee", ""))
                 funding = str(data.get("funding", ""))
                 net_pnl = self._net_pnl(realized, fee, funding)
-                side = OpenPosition.normalize_side(
-                    data.get("side", "")
-                )
+                side = self._position_side_for_event(channel, data)
                 net_text = (
                     f"{net_pnl} USDT"
                     if net_pnl is not None
@@ -1197,9 +1544,7 @@ class PositionMonitor:
                         symbol,
                         str(data.get("positionId", "")),
                     )
-                side = OpenPosition.normalize_side(
-                    data.get("side", "")
-                )
+                side = self._position_side_for_event(channel, data)
                 trigger_price = data.get(
                     "tpPrice",
                 ) or data.get(
@@ -1293,6 +1638,7 @@ class PositionMonitor:
         group.verified_client_ids.discard(client_id)
         if not group.expected_client_ids:
             self._entry_fill_groups.pop(prefix, None)
+            self._pending_plan_notifications.discard(prefix)
 
     def _record_entry_fill(self, data: dict) -> str | None:
         client_id = str(data.get("clientId", ""))

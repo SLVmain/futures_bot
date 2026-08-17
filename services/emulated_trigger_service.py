@@ -100,13 +100,14 @@ class EmulatedTriggerStore:
         )
 
 
-Notify = Callable[[str], Awaitable[None]]
+Notify = Callable[[str, str | None], Awaitable[None]]
 Register = Callable[[TradePlan, object], Awaitable[None]]
 
 
 class EmulatedTriggerService:
     ACTIVE = "ARMED"
     SUSPENDED = "SUSPENDED"
+    EXPIRED_PENDING = "EXPIRED_PENDING"
 
     def __init__(
         self,
@@ -157,7 +158,22 @@ class EmulatedTriggerService:
         # crossed while it was offline, so late entry is deliberately blocked.
         now = time.time()
         for execution_id, record in tuple(self.records.items()):
-            if record.status == self.ACTIVE:
+            if record.status == "EXPIRED":
+                self.records[execution_id] = replace(
+                    record,
+                    status=self.EXPIRED_PENDING,
+                    updated_at=now,
+                )
+            elif (
+                record.status in {self.ACTIVE, self.SUSPENDED}
+                and now - record.created_at > self.max_age_seconds
+            ):
+                self.records[execution_id] = replace(
+                    record,
+                    status=self.EXPIRED_PENDING,
+                    updated_at=now,
+                )
+            elif record.status == self.ACTIVE:
                 self.records[execution_id] = replace(
                     record,
                     status=self.SUSPENDED,
@@ -168,7 +184,7 @@ class EmulatedTriggerService:
             if record.status in {"LIMIT_PLACED", "PARTIAL_PLACED"}:
                 self._schedule_limit_timeout(execution_id)
         self._task = asyncio.create_task(self._run(), name="entry-triggers")
-        return self.suspended()
+        return self.attention_required()
 
     async def stop(self) -> None:
         self._stop.set()
@@ -223,6 +239,28 @@ class EmulatedTriggerService:
             if item.status == self.SUSPENDED
         )
 
+    def waiting(self) -> tuple[EmulatedTrigger, ...]:
+        waiting_statuses = {
+            self.ACTIVE,
+            self.SUSPENDED,
+            self.EXPIRED_PENDING,
+        }
+        return tuple(
+            sorted(
+                (
+                    item for item in self.records.values()
+                    if item.status in waiting_statuses
+                ),
+                key=lambda item: item.created_at,
+            )
+        )
+
+    def attention_required(self) -> tuple[EmulatedTrigger, ...]:
+        return tuple(
+            item for item in self.waiting()
+            if item.status in {self.SUSPENDED, self.EXPIRED_PENDING}
+        )
+
     def get(self, execution_id: str) -> EmulatedTrigger | None:
         return self.records.get(execution_id)
 
@@ -255,7 +293,22 @@ class EmulatedTriggerService:
         if price is None:
             return False, "Не удалось получить текущую цену Bitunix", None
         if time.time() - record.created_at > self.max_age_seconds:
-            return False, "Срок действия триггера истёк", price
+            async with self._lock:
+                current = self.records.get(execution_id)
+                if current is not None and current.status == self.SUSPENDED:
+                    self.records[execution_id] = replace(
+                        current,
+                        status=self.EXPIRED_PENDING,
+                        updated_at=time.time(),
+                        last_price=price,
+                    )
+                    await asyncio.to_thread(self.store.save, self.records)
+            return (
+                False,
+                "Срок ожидания истёк: выберите сохранить ожидание "
+                "или отменить триггер",
+                price,
+            )
         if record.condition_met(price):
             return False, "Цена уже пересекла триггер во время остановки", price
         updated = replace(
@@ -269,9 +322,44 @@ class EmulatedTriggerService:
             await asyncio.to_thread(self.store.save, self.records)
         return True, "Триггер снова активен", price
 
+    async def keep_waiting(
+        self,
+        execution_id: str,
+    ) -> tuple[bool, str, float | None]:
+        record = self.records.get(execution_id)
+        if record is None or record.status != self.EXPIRED_PENDING:
+            return False, "Триггер уже изменён или не найден", None
+        price = await self.price_with_retries(record)
+        if price is None:
+            return False, "Не удалось получить текущую цену Bitunix", None
+        if record.condition_met(price):
+            return (
+                False,
+                "Цена уже пересекла триггер; поздний вход заблокирован",
+                price,
+            )
+        now = time.time()
+        async with self._lock:
+            current = self.records.get(execution_id)
+            if current is None or current.status != self.EXPIRED_PENDING:
+                return False, "Триггер уже изменён или не найден", price
+            self.records[execution_id] = replace(
+                current,
+                status=self.ACTIVE,
+                created_at=now,
+                updated_at=now,
+                last_price=price,
+            )
+            await asyncio.to_thread(self.store.save, self.records)
+        return True, "Ожидание сохранено; срок отсчитывается заново", price
+
     async def cancel(self, execution_id: str) -> bool:
         record = self.records.get(execution_id)
-        if record is None or record.status not in {self.ACTIVE, self.SUSPENDED}:
+        if record is None or record.status not in {
+            self.ACTIVE,
+            self.SUSPENDED,
+            self.EXPIRED_PENDING,
+        }:
             return False
         async with self._lock:
             self.records[execution_id] = replace(
@@ -299,10 +387,14 @@ class EmulatedTriggerService:
         if time.time() - record.created_at > self.max_age_seconds:
             await self._finish(
                 record,
-                "EXPIRED",
+                self.EXPIRED_PENDING,
                 record.last_price or record.plan.current_price,
-                f"⌛ Триггер {record.plan.side.value} "
-                f"{record.plan.symbol} истёк; ордер не отправлен.",
+                f"⌛ Срок ожидания триггера {record.plan.side.value} "
+                f"{record.plan.symbol} истёк; ордер не отправлен. "
+                "Сохранить ожидание или отменить триггер?",
+                notification_action=(
+                    f"trigger-expired:{record.plan.execution_id}"
+                ),
             )
             return
         price = await self.price_with_retries(record)
@@ -478,6 +570,7 @@ class EmulatedTriggerService:
         *,
         order_ids: tuple[str, ...] | None = None,
         limit_placed_at: float | None = None,
+        notification_action: str | None = None,
     ) -> None:
         async with self._lock:
             changes = {
@@ -494,7 +587,7 @@ class EmulatedTriggerService:
                 **changes,
             )
             await asyncio.to_thread(self.store.save, self.records)
-        await self.notify(message)
+        await self.notify(message, notification_action)
 
     def _schedule_limit_timeout(self, execution_id: str) -> None:
         existing = self._limit_tasks.get(execution_id)
