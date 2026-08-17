@@ -12,8 +12,8 @@ class TradeSettings:
     taker_fee_rate: float = 0.0006
     
     # Распределение позиции по тейкам
-    tp1_share: float = 0.5      # 50% на первый тейк
-    tp2_share: float = 0.25     # 25% на второй
+    tp1_share: float = 0.25     # 25% на первый тейк
+    tp2_share: float = 0.5      # 50% на второй
     tp3_share: float = 0.25     # 25% на третий
 
     @staticmethod

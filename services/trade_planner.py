@@ -2,7 +2,6 @@ from decimal import (
     Decimal,
     InvalidOperation,
     ROUND_DOWN,
-    ROUND_HALF_UP,
     ROUND_UP,
 )
 
@@ -327,13 +326,16 @@ class TradePlanner:
             limit_price = float(planned_entry)
             in_range = False
         elif not in_range and not force_market:
-            planned_entry = (
-                (
-                    Decimal(str(entry_min))
-                    + Decimal(str(entry_max))
+            if market_price < Decimal(str(entry_min)):
+                planned_entry = Decimal(str(entry_min)).quantize(
+                    price_step,
+                    rounding=ROUND_UP,
                 )
-                / Decimal("2")
-            ).quantize(price_step, rounding=ROUND_HALF_UP)
+            else:
+                planned_entry = Decimal(str(entry_max)).quantize(
+                    price_step,
+                    rounding=ROUND_DOWN,
+                )
             immediately_executable = (
                 signal.side is OrderSide.LONG
                 and planned_entry >= market_price
@@ -389,7 +391,7 @@ class TradePlanner:
         distributions = {
             1: (100,),
             2: (60, 40),
-            3: (50, 30, 20),
+            3: (25, 50, 25),
             4: (40, 30, 20, 10),
             5: (40, 25, 15, 10, 10),
         }

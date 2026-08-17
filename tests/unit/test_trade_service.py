@@ -97,8 +97,8 @@ def test_prepare_order_uses_all_configured_take_profits():
             leverage=10,
             risk_percent=1,
             max_tp_count=3,
-            tp1_share=0.5,
-            tp2_share=0.25,
+            tp1_share=0.25,
+            tp2_share=0.5,
             tp3_share=0.25,
         ),
     )
@@ -114,7 +114,7 @@ def test_prepare_order_uses_all_configured_take_profits():
         59.999998,
         64.999998,
     ]
-    assert result["tp_quantities"] == [1.0, 0.6, 0.4]
+    assert result["tp_quantities"] == [0.5, 1.0, 0.5]
     assert result["risk_budget"] == 10
     assert result["estimated_stop_loss"] == 10
     assert service.market.calls == 1

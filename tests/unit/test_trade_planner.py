@@ -58,9 +58,9 @@ def test_creates_immutable_trade_plan():
     assert plan.symbol == "BTCUSDT"
     assert plan.total_quantity == 2.0
     assert tuple(item.quantity for item in plan.take_profits) == (
+        0.5,
         1.0,
-        0.6,
-        0.4,
+        0.5,
     )
     assert tuple(item.price for item in plan.take_profits) == (
         54.98,
@@ -410,7 +410,7 @@ def test_short_tp_error_contains_tp_and_current_price():
         )
 
 
-def test_outside_range_creates_limit_plan_at_midpoint():
+def test_price_above_range_creates_limit_at_nearest_boundary():
     plan = make_planner(price=60).create_plan(
         make_signal(),
         AccountBalance("USDT", "1000"),
@@ -418,17 +418,23 @@ def test_outside_range_creates_limit_plan_at_midpoint():
 
     assert plan.in_range is False
     assert plan.order_type == "LIMIT"
-    assert plan.limit_price == 50
-    assert plan.planned_entry_price == 50
-    assert plan.total_quantity == 2
-    assert plan.estimated_stop_loss == 10
+    assert plan.limit_price == 51
+    assert plan.planned_entry_price == 51
+    assert plan.total_quantity == pytest.approx(1.666666)
+    assert plan.estimated_stop_loss == pytest.approx(9.999996)
 
 
 @pytest.mark.parametrize(
-    ("side", "current_price", "stop_loss", "take_profits"),
     (
-        (OrderSide.LONG, 40, 45, [55, 60, 65]),
-        (OrderSide.SHORT, 60, 55, [45, 40, 35]),
+        "side",
+        "current_price",
+        "stop_loss",
+        "take_profits",
+        "expected_boundary",
+    ),
+    (
+        (OrderSide.LONG, 40, 45, [55, 60, 65], 49),
+        (OrderSide.SHORT, 60, 55, [45, 40, 35], 51),
     ),
 )
 def test_creates_emulated_trigger_when_limit_would_execute_immediately(
@@ -436,6 +442,7 @@ def test_creates_emulated_trigger_when_limit_would_execute_immediately(
     current_price,
     stop_loss,
     take_profits,
+    expected_boundary,
 ):
     plan = make_planner(price=current_price).create_plan(
         make_signal(
@@ -447,7 +454,7 @@ def test_creates_emulated_trigger_when_limit_would_execute_immediately(
     )
 
     assert plan.order_type == "TRIGGER_LIMIT"
-    assert plan.trigger_price == 50
+    assert plan.trigger_price == expected_boundary
     assert plan.limit_price is None
     assert plan.in_range is False
 
@@ -473,7 +480,7 @@ def test_short_limit_above_market_remains_allowed():
     )
 
     assert plan.order_type == "LIMIT"
-    assert plan.limit_price == 50
+    assert plan.limit_price == 49
     assert plan.limit_price > plan.current_price
 
 
