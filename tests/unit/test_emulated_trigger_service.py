@@ -411,13 +411,34 @@ def test_trigger_blocks_entry_after_excessive_price_jump(tmp_path):
             tmp_path, Market(60), executor
         )
         await service.arm(make_plan())
-        service.market.price = 49
+        service.market.price = 48
 
         await service._check(service.get("trigger-one"))
 
         assert executor.plans == []
         assert service.get("trigger-one").status == "SUSPENDED"
         assert "цена ушла" in messages[0]
+
+    asyncio.run(scenario())
+
+
+def test_trigger_enters_when_price_is_inside_signal_range(tmp_path):
+    async def scenario():
+        executor = Executor()
+        service, messages, _ = make_service(
+            tmp_path,
+            Market(60),
+            executor,
+        )
+        await service.arm(make_plan())
+        service.market.price = 49
+
+        await service._check(service.get("trigger-one"))
+
+        assert len(executor.plans) == 1
+        assert service.get("trigger-one").status == "LIMIT_PLACED"
+        assert "Сработал триггер" in messages[0]
+        assert not any("цена ушла" in item for item in messages)
 
     asyncio.run(scenario())
 

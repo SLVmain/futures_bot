@@ -424,7 +424,20 @@ class EmulatedTriggerService:
             / trigger_price
             * Decimal("100")
         )
-        if deviation > self.max_entry_deviation_percent:
+        entry_low = Decimal(str(min(
+            record.plan.entry_min,
+            record.plan.entry_max,
+        )))
+        entry_high = Decimal(str(max(
+            record.plan.entry_min,
+            record.plan.entry_max,
+        )))
+        price_decimal = Decimal(str(price))
+        price_in_entry_range = entry_low <= price_decimal <= entry_high
+        if (
+            not price_in_entry_range
+            and deviation > self.max_entry_deviation_percent
+        ):
             await self._finish(
                 record,
                 self.SUSPENDED,
