@@ -73,11 +73,11 @@ class SignalParser:
                 if sl_range_match:
                     sl_1 = float(sl_range_match.group(1).replace(',', '.'))
                     sl_2 = float(sl_range_match.group(2).replace(',', '.'))
-                    # Ближний стоп в зависимости от стороны
+                    # Дальний стоп по направлению возможного убытка.
                     if side == OrderSide.LONG:
-                        stop_loss = max(sl_1, sl_2)  # ближе к цене сверху
+                        stop_loss = min(sl_1, sl_2)
                     else:
-                        stop_loss = min(sl_1, sl_2)  # ближе к цене снизу
+                        stop_loss = max(sl_1, sl_2)
             
             if stop_loss is None:
                 return None

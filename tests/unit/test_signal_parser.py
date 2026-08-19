@@ -38,3 +38,27 @@ def test_returns_none_for_message_without_direction():
 """
 
     assert SignalParser.parse(message) is None
+
+
+@pytest.mark.parametrize(
+    ("side_text", "stop_range", "expected_stop"),
+    [
+        ("LONG", "59,5-58,5", 58.5),
+        ("SHORT", "62,5-63,5", 63.5),
+    ],
+)
+def test_stop_range_uses_farthest_loss_boundary(
+    side_text,
+    stop_range,
+    expected_stop,
+):
+    message = f"""#BTCUSDT {side_text}
+Диапазон входа: 60-61
+Цели: 62 / 63 / 64
+Диапазон стопа: {stop_range}
+"""
+
+    signal = SignalParser.parse(message)
+
+    assert signal is not None
+    assert signal.stop_loss == expected_stop
