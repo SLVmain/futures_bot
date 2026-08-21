@@ -26,7 +26,7 @@ class OrderService:
         tp_stop_type: str = "LAST_PRICE",
         tp_order_type: str = "MARKET",
         sl_price: float = None,
-        sl_stop_type: str = "LAST_PRICE",
+        sl_stop_type: str = "MARK_PRICE",
         sl_order_type: str = "MARKET",
         client_id: str = None,
     ) -> OrderResult:

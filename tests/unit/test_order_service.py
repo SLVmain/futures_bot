@@ -54,7 +54,7 @@ def test_place_order_returns_raw_api_response(response):
         "tpStopType": "LAST_PRICE",
         "tpOrderType": "MARKET",
         "slPrice": "59000",
-        "slStopType": "LAST_PRICE",
+        "slStopType": "MARK_PRICE",
         "slOrderType": "MARKET",
     }
 

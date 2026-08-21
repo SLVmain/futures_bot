@@ -57,7 +57,7 @@ def test_detects_missing_stop_loss():
     )
 
 
-def test_places_position_stop_loss_with_last_price_trigger():
+def test_places_position_stop_loss_with_mark_price_trigger():
     client = FakeClient()
     service = ProtectionService(client)
 
@@ -76,7 +76,27 @@ def test_places_position_stop_loss_with_last_price_trigger():
             "symbol": "BTCUSDT",
             "positionId": "position-1",
             "slPrice": "45",
-            "slStopType": "LAST_PRICE",
+            "slStopType": "MARK_PRICE",
+            "slOrderType": "MARKET",
+            "slQty": "1",
+        },
+    )
+
+
+def test_modified_stop_loss_keeps_mark_price_market_execution():
+    client = FakeClient()
+    service = ProtectionService(client)
+
+    order_id = service.modify_stop_loss("sl-1", "50", "1")
+
+    assert order_id == "sl-new"
+    assert client.call == (
+        "/api/v1/futures/tpsl/modify_order",
+        "",
+        {
+            "orderId": "sl-1",
+            "slPrice": "50",
+            "slStopType": "MARK_PRICE",
             "slOrderType": "MARKET",
             "slQty": "1",
         },

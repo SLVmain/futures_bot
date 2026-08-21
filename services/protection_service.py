@@ -72,7 +72,7 @@ class ProtectionService:
                 "symbol": symbol,
                 "positionId": position_id,
                 "slPrice": str(price),
-                "slStopType": "LAST_PRICE",
+                "slStopType": "MARK_PRICE",
                 "slOrderType": "MARKET",
                 "slQty": str(quantity),
             },
@@ -98,7 +98,7 @@ class ProtectionService:
             {
                 "orderId": order_id,
                 "slPrice": price,
-                "slStopType": "LAST_PRICE",
+                "slStopType": "MARK_PRICE",
                 "slOrderType": "MARKET",
                 "slQty": quantity,
             },

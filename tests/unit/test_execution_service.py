@@ -95,6 +95,8 @@ def test_executes_existing_plan_without_market_lookup():
         "65",
     ]
     assert [item["slPrice"] for item in batch] == ["45", "45", "45"]
+    assert all(item["slStopType"] == "MARK_PRICE" for item in batch)
+    assert all(item["slOrderType"] == "MARKET" for item in batch)
     assert [item["clientId"] for item in batch] == [
         f"bot-{plan.execution_id[:20]}-1",
         f"bot-{plan.execution_id[:20]}-2",

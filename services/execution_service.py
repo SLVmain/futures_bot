@@ -93,7 +93,7 @@ class ExecutionService:
                 "tpStopType": "LAST_PRICE",
                 "tpOrderType": "MARKET",
                 "slPrice": str(plan.stop_loss),
-                "slStopType": "LAST_PRICE",
+                "slStopType": "MARK_PRICE",
                 "slOrderType": "MARKET",
             }
             if plan.limit_price is not None:
